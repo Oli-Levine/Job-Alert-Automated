@@ -12,7 +12,7 @@
  *   2. One call per job: Claude uses its server-side web_fetch tool to
  *      open the job link and write a 2-line description.
  *
- * OUTPUT: a single "JD Test" tab — Company | Location | Date | Job Description
+ * OUTPUT: a single "JD Test" tab — Company | Location | Date | Job Description | Link
  *   - Date is the date the alert email arrived (same as V17's Date Found).
  *   - If the page couldn't be fetched (LinkedIn/Indeed often block bots),
  *     the description cell says "FETCH FAILED (<reason>)" instead of
@@ -33,11 +33,11 @@ const JD_CONFIG = {
   MAX_JOBS: 10, // cap per run — each job is one API call with a web fetch
   CLAUDE_API_URL: 'https://api.anthropic.com/v1/messages',
   // web_fetch_20260209 needs a 4.6+ Opus/Sonnet model — Haiku 4.5 (used
-  // by V17) only supports the older fetch tool.
-  CLAUDE_MODEL: 'claude-opus-5'
+  // by V17) only supports the older fetch tool. Sonnet keeps cost down.
+  CLAUDE_MODEL: 'claude-sonnet-5'
 };
 
-const JD_HEADERS = ['Company', 'Location', 'Date', 'Job Description'];
+const JD_HEADERS = ['Company', 'Location', 'Date', 'Job Description', 'Link'];
 
 const JD_JOB_LINK_PATTERNS = [
   /indeed\.com\/rc\/clk\/dl/i, /indeed\.com\/pagead\/clk\/dl/i,
@@ -83,7 +83,7 @@ function testJobDescriptions() {
         else fetched++;
 
         Logger.log(`${job.company} | ${job.town} | ${url}\n  -> ${description}`);
-        rows.push([job.company, job.town || '', msg.getDate(), description]);
+        rows.push([job.company, job.town || '', msg.getDate(), description, url]);
       }
     }
   }
@@ -97,6 +97,7 @@ function testJobDescriptions() {
   sheet.setFrozenRows(1);
   sheet.autoResizeColumns(1, 3);
   sheet.setColumnWidth(4, 500);
+  sheet.setColumnWidth(5, 150); // full URLs are unreadable when auto-sized
   sheet.getRange(1, 4, rows.length + 1, 1).setWrap(true);
 
   Logger.log(`Done. ${rows.length} jobs written — ${fetched} descriptions fetched, ${failed} failed.`);
@@ -195,7 +196,6 @@ function jdCallClaude(body) {
   }
 
   body.model = JD_CONFIG.CLAUDE_MODEL;
-  body.fallbacks = 'default'; // if Claude declines on safety grounds, retry on the recommended fallback model
 
   let response;
   try {
@@ -204,8 +204,7 @@ function jdCallClaude(body) {
       contentType: 'application/json',
       headers: {
         'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': 'server-side-fallback-2026-07-01'
+        'anthropic-version': '2023-06-01'
       },
       payload: JSON.stringify(body),
       muteHttpExceptions: true
