@@ -1,7 +1,34 @@
 /**
- * JOB ALERT AUTOMATION v17
+ * JOB ALERT AUTOMATION v18
  * ------------------------------------------------------------
- * CHANGES FROM v16:
+ * CHANGES FROM v17:
+ *   - REMOVED the 5 per-consultant tabs (Craig, Alison, Tom, Josh, Ray).
+ *     Every job that used to route to a consultant tab now writes to a
+ *     single flat "New Leads" tab instead — no Consultant column, no
+ *     Region column, no section headings, sorted newest-first.
+ *   - A region that used to fan out to two consultant tabs (North West ->
+ *     Craig AND Alison) now collapses to exactly one row in New Leads,
+ *     since REGION_TO_TABS maps every non-"Other" region to the same
+ *     single target tab.
+ *   - Dedup (composite title+company+town key), the 30-day resurfacing
+ *     window, and the 84-day retention purge all now run against New
+ *     Leads as a single tab instead of being split per-consultant.
+ *   - New Leads keeps the resurfacing behaviour consultant tabs had
+ *     (bold + amber HIGH_PRIORITY_BG on a job that reappears after
+ *     RESURFACE_WINDOW_DAYS, old link dropped, carried forward across
+ *     rebuilds) via a new rebuildNewLeadsTab() — a flat version of the
+ *     old rebuildConsultantTab() with the region-sectioning removed.
+ *     This is different from Other's simpler always-append pattern,
+ *     which New Leads deliberately does NOT use.
+ *   - Company Blocklist, Company Regions, Needs Review, Filtered Out,
+ *     and Other are untouched — same schema, same logic.
+ *   - Added migrateConsultantTabsToNewLeads(), a one-off migration to
+ *     pull existing rows out of the old consultant tabs (deduped by
+ *     Link) into New Leads. Run it once after deploying v18; it leaves
+ *     the old tabs in place for you to delete manually once New Leads
+ *     looks right.
+ *
+ * CHANGES FROM v16 (carried forward):
  *   - NEW "Company Regions" tab added: Company | Region. A manually
  *     maintained override list — if a company on this list produces a
  *     job the AI classified as region "Other" (i.e. Remote/UK-wide
@@ -24,39 +51,11 @@
  *     misroute or a failed run.
  *   - Company Regions is a standing reference list, like Company
  *     Blocklist — NOT subject to the 84-day purge.
- *
- * CHANGES FROM v15 (carried forward):
- *   - 12-WEEK (84-day) DATA RETENTION PURGE added, based on Date Found.
- *   - Company Blocklist is explicitly EXEMPT from purge — it's a standing
- *     list, not job data, and doesn't age out.
- *   - Everywhere else (consultant tabs, Other, Needs Review, Filtered Out)
- *     purges rows 84+ days old. This deliberately gives up the "permanent"
- *     dedup memory on Filtered Out / Needs Review after 84 days — if a
- *     blocklisted company or bad listing reappears after that, it just
- *     gets reprocessed and re-filtered/re-reviewed. Accepted tradeoff,
- *     not a bug.
- *   - Consultant tab purge folds directly into rebuildConsultantTab()'s
- *     existing read-back pass — an expired row is simply never carried
- *     forward into the rebuilt sheet, same place stale-link removal
- *     already happens. No structural changes to that function's layout.
- *   - Flat-grid tabs (Other, Needs Review, Filtered Out) get a new
- *     shared purgeExpiredRows() helper — a straightforward "delete rows
- *     older than PURGE_WINDOW_DAYS" pass. Written generically so it can
- *     be reused for Dispatch Log once Part 2 builds that tab.
- *   - IMPORTANT BEHAVIOUR CHANGE: consultant tabs now ALWAYS rebuild on
- *     every run (not just when touched by a new routed job this run),
- *     and Other/Needs Review/Filtered Out always run their purge pass
- *     regardless of whether they were touched. This is required so purge
- *     actually runs daily rather than only when a tab happens to receive
- *     new data — otherwise a quiet consultant tab could sit un-purged
- *     indefinitely. Cost is negligible at this volume (a handful of
- *     sheets, cheap read/write passes).
- *   - Purge activity is logged with a row count per tab when anything is
- *     actually removed.
  */
 
 const CONFIG = {
   MARK_EMAIL: 'marklevine@bcllegal.com',
+  NEW_LEADS_SHEET_NAME: 'New Leads',
   NEEDS_REVIEW_SHEET_NAME: 'Needs Review',
   FILTERED_SHEET_NAME: 'Filtered Out',
   OTHER_SHEET_NAME: 'Other',
@@ -77,31 +76,30 @@ const REGIONS = [
   'London', 'South West', 'Ireland', 'East Anglia', 'Other'
 ];
 
-// ---- Region -> consultant tab(s) mapping ------------------------------------
+// ---- Region -> destination tab(s) mapping -----------------------------------
+// Every region except "Other" lands in the single New Leads tab (v18 —
+// previously fanned out across 5 per-consultant tabs, with North West going
+// to both Craig and Alison). "Other" keeps its own separate flat tab.
 const REGION_TO_TABS = {
-  'Scotland': ['Craig'],
-  'North West': ['Craig', 'Alison'],
-  'Ireland': ['Alison'],
-  'North East': ['Tom'],
-  'Yorkshire': ['Tom'],
-  'West Midlands': ['Josh'],
-  'East Midlands': ['Josh'],
-  'South West': ['Josh'],
-  'London': ['Ray'],
-  'Northern Home Counties': ['Ray'],
-  'Southern Home Counties': ['Ray'],
-  'East Anglia': ['Ray'],
+  'Scotland': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'North West': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'Ireland': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'North East': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'Yorkshire': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'West Midlands': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'East Midlands': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'South West': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'London': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'Northern Home Counties': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'Southern Home Counties': [CONFIG.NEW_LEADS_SHEET_NAME],
+  'East Anglia': [CONFIG.NEW_LEADS_SHEET_NAME],
   'Other': [CONFIG.OTHER_SHEET_NAME]
 };
 
-const TAB_TO_REGIONS = {
-  'Craig': ['North West', 'Scotland'],
-  'Alison': ['North West', 'Ireland'],
-  'Tom': ['North East', 'Yorkshire'],
-  'Josh': ['West Midlands', 'East Midlands', 'South West'],
-  'Ray': ['London', 'Northern Home Counties', 'Southern Home Counties', 'East Anglia']
-};
-const CONSULTANT_TABS = Object.keys(TAB_TO_REGIONS);
+// Tabs that get the full rebuild-and-replace treatment (resurface flagging,
+// stale-link removal, purge folded into read-back) rather than Other's
+// simpler always-append pattern.
+const REBUILD_TABS = [CONFIG.NEW_LEADS_SHEET_NAME];
 const FLAT_TABS = [CONFIG.OTHER_SHEET_NAME];
 const ALL_TAB_NAMES = [...new Set(Object.values(REGION_TO_TABS).flat())];
 
@@ -158,13 +156,13 @@ function processJobAlerts() {
   const { links: reviewLinks, keyInfo: reviewKeyInfo } = loadExistingLinksAndKeys(reviewSheet);
   const { links: filteredLinks, keyInfo: filteredKeyInfo } = loadExistingLinksAndKeys(filteredSheet);
 
-  // Tracks, per consultant tab, which OLD links need to be dropped during
-  // rebuild because their job just resurfaced under a new link.
+  // Tracks, per rebuild tab (New Leads), which OLD links need to be dropped
+  // during rebuild because their job just resurfaced under a new link.
   const staleLinksByTab = {};
-  // Tracks, per consultant tab, which NEW links should be flagged as high
-  // priority during rebuild (i.e. the resurfaced job's new link).
+  // Tracks, per rebuild tab (New Leads), which NEW links should be flagged
+  // as high priority during rebuild (i.e. the resurfaced job's new link).
   const highPriorityLinksByTab = {};
-  CONSULTANT_TABS.forEach(tabName => {
+  REBUILD_TABS.forEach(tabName => {
     staleLinksByTab[tabName] = new Set();
     highPriorityLinksByTab[tabName] = new Set();
   });
@@ -173,7 +171,7 @@ function processJobAlerts() {
   const threads = GmailApp.search(query);
 
   const newRowsByTab = {};
-  ALL_TAB_NAMES.forEach(tabName => { newRowsByTab[tabName] = {}; });
+  ALL_TAB_NAMES.forEach(tabName => { newRowsByTab[tabName] = []; });
   const touchedTabs = new Set();
 
   let addedCount = 0, filteredCount = 0, reviewCount = 0, skippedEmails = 0, resurfacedCount = 0, blockedCount = 0, companyRegionOverrideCount = 0;
@@ -260,7 +258,7 @@ function processJobAlerts() {
             // Past the window: treat as a resurfaced job. Mark the old
             // link for removal, and the new link for high-priority
             // flagging, on this tab's rebuild.
-            if (CONSULTANT_TABS.includes(tabName)) {
+            if (REBUILD_TABS.includes(tabName)) {
               if (existing.link) staleLinksByTab[tabName].add(existing.link);
               if (link) highPriorityLinksByTab[tabName].add(link);
             }
@@ -269,8 +267,7 @@ function processJobAlerts() {
 
           if (link) linkSet.add(link);
           keyInfo.set(jobKey, { date: dateFound, link: link });
-          if (!newRowsByTab[tabName][region]) newRowsByTab[tabName][region] = [];
-          newRowsByTab[tabName][region].push([source, job.title, job.company, town, dateFound, link]);
+          newRowsByTab[tabName].push([source, job.title, job.company, town, dateFound, link]);
           touchedTabs.add(tabName);
           addedCount++;
         });
@@ -278,15 +275,13 @@ function processJobAlerts() {
     });
   });
 
-  // Consultant tabs ALWAYS rebuild, every run — not gated on touchedTabs.
-  // This is what makes the 84-day purge (folded into rebuildConsultantTab)
-  // actually run daily, even for a consultant who received no new jobs
-  // this cycle.
-  let consultantPurgedTotal = 0;
-  CONSULTANT_TABS.forEach(tabName => {
-    consultantPurgedTotal += rebuildConsultantTab(
+  // New Leads ALWAYS rebuilds, every run — not gated on touchedTabs. This is
+  // what makes the 84-day purge (folded into rebuildNewLeadsTab) actually
+  // run daily, even on a run with no new jobs.
+  let rebuildPurgedTotal = 0;
+  REBUILD_TABS.forEach(tabName => {
+    rebuildPurgedTotal += rebuildNewLeadsTab(
       tabSheets[tabName],
-      TAB_TO_REGIONS[tabName],
       newRowsByTab[tabName],
       staleLinksByTab[tabName],
       highPriorityLinksByTab[tabName]
@@ -298,8 +293,7 @@ function processJobAlerts() {
   FLAT_TABS.forEach(tabName => {
     const sheet = tabSheets[tabName];
     if (touchedTabs.has(tabName)) {
-      const region = Object.keys(REGION_TO_TABS).find(r => REGION_TO_TABS[r].includes(tabName));
-      (newRowsByTab[tabName][region] || []).forEach(row => sheet.appendRow(row));
+      newRowsByTab[tabName].forEach(row => sheet.appendRow(row));
     }
     const purged = purgeExpiredRows(sheet);
     if (purged > 0) Logger.log(`${tabName}: purged ${purged} row(s) older than ${CONFIG.PURGE_WINDOW_DAYS} days.`);
@@ -318,8 +312,8 @@ function processJobAlerts() {
     autoResizeSheet(sheet);
   });
 
-  if (consultantPurgedTotal > 0) {
-    Logger.log(`Consultant tabs: purged ${consultantPurgedTotal} row(s) total older than ${CONFIG.PURGE_WINDOW_DAYS} days.`);
+  if (rebuildPurgedTotal > 0) {
+    Logger.log(`New Leads: purged ${rebuildPurgedTotal} row(s) older than ${CONFIG.PURGE_WINDOW_DAYS} days.`);
   }
 
   Logger.log(`Done. ${addedCount} rows written (${resurfacedCount} flagged high priority as resurfaced after ${CONFIG.RESURFACE_WINDOW_DAYS}+ days, ${companyRegionOverrideCount} redirected from Other via Company Regions). ${reviewCount} sent to Needs Review. ${filteredCount} filtered out (${blockedCount} due to blocklist). ${skippedEmails} email(s) skipped due to API/parse errors.`);
@@ -486,13 +480,12 @@ ${emailText}`;
 }
 
 // ==========================================================================
-// CONSULTANT TAB REBUILD
+// NEW LEADS REBUILD
 // ==========================================================================
-// Heading-row detection requires EVERY other column to be blank (not just
-// Link), so a routed job with an unresolved link can never be misread as a
-// region heading on rebuild. Job rows with no Link are intentionally
-// dropped — a route with no resolvable link shouldn't show to consultants
-// anyway.
+// Flat equivalent of the old per-consultant rebuild (v17): same
+// read-clear-rewrite pattern, same resurface flagging and purge, but no
+// region sections — just one sorted, newest-first list. Job rows with no
+// Link are intentionally dropped, same as before.
 //
 // staleLinks: existing rows whose Link is in this set are dropped during
 // read-back (superseded by a resurfaced version under a new link).
@@ -507,112 +500,72 @@ ${emailText}`;
 // during the same read-back pass, right alongside stale-link removal.
 // Returns the count of purged rows so the caller can log it.
 
-function rebuildConsultantTab(sheet, regionsForTab, newRowsByRegion, staleLinks, highPriorityLinks) {
+function rebuildNewLeadsTab(sheet, newRows, staleLinks, highPriorityLinks) {
   if (!sheet) {
-    Logger.log('rebuildConsultantTab called with no sheet — check that your tab names exactly match Craig, Alison, Tom, Josh, Ray (case-sensitive, no extra spaces).');
+    Logger.log(`rebuildNewLeadsTab called with no sheet — check that CONFIG.NEW_LEADS_SHEET_NAME ("${CONFIG.NEW_LEADS_SHEET_NAME}") matches the tab name exactly.`);
     return 0;
   }
+  newRows = newRows || [];
   staleLinks = staleLinks || new Set();
   highPriorityLinks = highPriorityLinks || new Set();
   const lastRow = sheet.getLastRow();
   const numCols = TAB_HEADERS.length;
 
-  let existingByRegion = {};
-  regionsForTab.forEach(r => { existingByRegion[r] = []; });
-
   // Carries forward any row already flagged high-priority from a previous
   // run, detected by its current background colour before the sheet gets
   // cleared below.
+  const existingRows = [];
   const carriedFlags = new Set();
   let purgedCount = 0;
 
   if (lastRow >= 1) {
     const data = sheet.getRange(1, 1, lastRow, numCols).getValues();
     const backgrounds = sheet.getRange(1, 1, lastRow, numCols).getBackgrounds();
-    let currentRegion = null;
     data.forEach((row, idx) => {
-      const colA = String(row[0] || '').trim();
       const isHeaderRow = row.join('|') === TAB_HEADERS.join('|');
-      const restBlank = row.slice(1).every(cell => cell === '' || cell === null);
-
-      if (regionsForTab.includes(colA) && restBlank) {
-        // Region heading row — column A matches a region name AND every
-        // other cell is blank. A real job with a blank link would still
-        // have title/company/town filled in, so this can't collide.
-        currentRegion = colA;
-        return;
-      }
       if (isHeaderRow) return; // repeated column-header row — not a job
-      if (row[5] && currentRegion && !staleLinks.has(row[5])) {
-        // Job row (has a Link) under the most recent heading, and not
-        // superseded by a resurfaced version of the same job.
-        if (isExpired(row[4])) {
-          purgedCount++;
-          return; // 84+ days old — drop it, don't carry forward
-        }
-        existingByRegion[currentRegion].push(row);
-        if (backgrounds[idx][5] === HIGH_PRIORITY_BG) {
-          carriedFlags.add(row[5]);
-        }
+      if (!row[5] || staleLinks.has(row[5])) return; // no link, or superseded by a resurfaced version
+      if (isExpired(row[4])) {
+        purgedCount++;
+        return; // 84+ days old — drop it, don't carry forward
+      }
+      existingRows.push(row);
+      if (backgrounds[idx][5] === HIGH_PRIORITY_BG) {
+        carriedFlags.add(row[5]);
       }
     });
   }
 
   const allFlaggedLinks = new Set([...carriedFlags, ...highPriorityLinks]);
 
-  const grouped = {};
-  regionsForTab.forEach(region => {
-    const newRows = newRowsByRegion[region] || [];
-    grouped[region] = existingByRegion[region].concat(newRows);
+  const seen = new Set();
+  const combined = existingRows.concat(newRows).filter(row => {
+    const link = row[5];
+    if (!link) return true;
+    if (seen.has(link)) return false;
+    seen.add(link);
+    return true;
   });
+  combined.sort((a, b) => new Date(b[4]) - new Date(a[4]));
 
-  regionsForTab.forEach(region => {
-    const seen = new Set();
-    grouped[region] = grouped[region].filter(row => {
-      const link = row[5];
-      if (!link) return true;
-      if (seen.has(link)) return false;
-      seen.add(link);
-      return true;
-    });
-    grouped[region].sort((a, b) => new Date(b[4]) - new Date(a[4]));
-  });
-
-  const maxRows = sheet.getMaxRows();
-  const maxCols = sheet.getMaxColumns();
-  sheet.getRange(1, 1, maxRows, maxCols).breakApart();
   sheet.clear();
 
-  let currentRow = 1;
-  regionsForTab.forEach(region => {
-    const headingRange = sheet.getRange(currentRow, 1, 1, numCols);
-    headingRange.merge();
-    sheet.getRange(currentRow, 1).setValue(region)
-      .setFontWeight('bold').setFontSize(12).setBackground('#d9d9d9');
-    currentRow++;
+  sheet.getRange(1, 1, 1, numCols).setValues([TAB_HEADERS]).setFontWeight('bold');
 
-    sheet.getRange(currentRow, 1, 1, numCols).setValues([TAB_HEADERS]).setFontWeight('bold');
-    currentRow++;
+  if (combined.length > 0) {
+    const dataStartRow = 2;
+    sheet.getRange(dataStartRow, 1, combined.length, numCols).setValues(combined);
+    sheet.getRange(dataStartRow, 5, combined.length, 1).setNumberFormat('dd/mm/yyyy hh:mm');
 
-    if (grouped[region].length > 0) {
-      const dataStartRow = currentRow;
-      sheet.getRange(dataStartRow, 1, grouped[region].length, numCols).setValues(grouped[region]);
-      sheet.getRange(dataStartRow, 5, grouped[region].length, 1).setNumberFormat('dd/mm/yyyy hh:mm');
-
-      // Apply the high-priority flag to any row whose link is flagged.
-      grouped[region].forEach((rowData, i) => {
-        if (allFlaggedLinks.has(rowData[5])) {
-          sheet.getRange(dataStartRow + i, 1, 1, numCols)
-            .setBackground(HIGH_PRIORITY_BG)
-            .setFontWeight('bold');
-        }
-      });
-
-      currentRow += grouped[region].length;
-    }
-
-    currentRow++;
-  });
+    // Apply the high-priority flag to any row whose link is flagged.
+    combined.forEach((rowData, i) => {
+      if (allFlaggedLinks.has(rowData[5])) {
+        sheet.getRange(dataStartRow + i, 1, 1, numCols)
+          .setBackground(HIGH_PRIORITY_BG)
+          .setFontWeight('bold');
+      }
+    });
+  }
 
   sheet.autoResizeColumns(1, numCols);
   applyFixedLinkColumnWidth(sheet);
@@ -627,10 +580,10 @@ function rebuildConsultantTab(sheet, regionsForTab, newRowsByRegion, staleLinks,
 function refreshAllFormatting() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  CONSULTANT_TABS.forEach(tabName => {
+  REBUILD_TABS.forEach(tabName => {
     const sheet = ss.getSheetByName(tabName);
     if (!sheet) return;
-    rebuildConsultantTab(sheet, TAB_TO_REGIONS[tabName], {});
+    rebuildNewLeadsTab(sheet, []);
     Logger.log(`${tabName}: formatting refreshed.`);
   });
 
@@ -652,22 +605,15 @@ function refreshAllFormatting() {
 function resetAllJobData() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  CONSULTANT_TABS.forEach(tabName => {
-    const sheet = ss.getSheetByName(tabName);
-    if (!sheet) return;
-    sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).breakApart();
-    sheet.clear();
-  });
-
-  const otherTabs = [...FLAT_TABS, CONFIG.NEEDS_REVIEW_SHEET_NAME, CONFIG.FILTERED_SHEET_NAME];
-  otherTabs.forEach(tabName => {
+  const clearedTabs = [...REBUILD_TABS, ...FLAT_TABS, CONFIG.NEEDS_REVIEW_SHEET_NAME, CONFIG.FILTERED_SHEET_NAME];
+  clearedTabs.forEach(tabName => {
     const sheet = ss.getSheetByName(tabName);
     if (!sheet) return;
     const lastRow = sheet.getLastRow();
     if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
   });
 
-  Logger.log('All job data cleared. Run restructureAllConsultantTabs() to rebuild empty section skeletons, then processJobAlerts() to repopulate fresh.');
+  Logger.log('All job data cleared. Run processJobAlerts() to repopulate fresh.');
 }
 
 // ==========================================================================
@@ -698,7 +644,7 @@ function cleanupBrokenIndeedLinks() {
   });
 
   Logger.log(`Done. ${removedCount} broken Indeed link row(s) cleared.`);
-  Logger.log('Next: run restructureAllConsultantTabs() to tidy up consultant tabs, then processJobAlerts() to re-fetch these jobs with working links (only if the original email is still within LOOKBACK_DAYS).');
+  Logger.log('Next: run refreshAllFormatting() to tidy up New Leads (drops the now-blank rows on rebuild), then processJobAlerts() to re-fetch these jobs with working links (only if the original email is still within LOOKBACK_DAYS).');
 }
 
 // ==========================================================================
@@ -739,26 +685,53 @@ function debugListSheetNames() {
     Logger.log(`[${sheet.getName()}]  (length: ${sheet.getName().length})`);
   });
   Logger.log('---');
-  Logger.log('Expected consultant tab names:');
-  CONSULTANT_TABS.forEach(name => Logger.log(`[${name}]  (length: ${name.length})`));
+  Logger.log('Expected working tab names:');
+  ALL_TAB_NAMES.forEach(name => Logger.log(`[${name}]  (length: ${name.length})`));
 }
 
 // ==========================================================================
-// ONE-OFF MIGRATION
+// ONE-OFF MIGRATION — v17 consultant tabs -> v18 New Leads
 // ==========================================================================
+// Run this ONCE after deploying v18. Pulls every job row out of the old
+// per-consultant tabs, dedupes by Link (a North West job used to live in
+// BOTH Craig's and Alison's tab — this collapses it back to one row), and
+// rebuilds New Leads as a flat, newest-first list via the same
+// rebuildNewLeadsTab() the daily run uses. Leaves the old tabs in place —
+// delete Craig/Alison/Tom/Josh/Ray manually once New Leads looks right.
 
-function restructureAllConsultantTabs() {
+const OLD_CONSULTANT_TAB_NAMES = ['Craig', 'Alison', 'Tom', 'Josh', 'Ray'];
+
+function migrateConsultantTabsToNewLeads() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  CONSULTANT_TABS.forEach(tabName => {
+  const seenLinks = new Set();
+  const migratedRows = [];
+
+  OLD_CONSULTANT_TAB_NAMES.forEach(tabName => {
     const sheet = ss.getSheetByName(tabName);
     if (!sheet) {
       Logger.log(`${tabName}: sheet not found, skipping.`);
       return;
     }
-    rebuildConsultantTab(sheet, TAB_TO_REGIONS[tabName], {});
-    Logger.log(`${tabName}: restructured into sections.`);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 1) return;
+    const numCols = TAB_HEADERS.length;
+    const data = sheet.getRange(1, 1, lastRow, numCols).getValues();
+
+    data.forEach(row => {
+      const isHeaderRow = row.join('|') === TAB_HEADERS.join('|');
+      const restBlank = row.slice(1).every(cell => cell === '' || cell === null);
+      if (isHeaderRow || (restBlank && row[0])) return; // header or region heading row
+      if (!row[5] || seenLinks.has(row[5])) return; // no link, or already pulled from another tab
+      seenLinks.add(row[5]);
+      migratedRows.push(row);
+    });
   });
-  Logger.log('Done. All consultant tabs restructured.');
+
+  const newLeadsSheet = getOrCreateSheet(ss, CONFIG.NEW_LEADS_SHEET_NAME);
+  const purged = rebuildNewLeadsTab(newLeadsSheet, migratedRows, new Set(), new Set());
+  const purgedNote = purged > 0 ? ` (${purged} already past the ${CONFIG.PURGE_WINDOW_DAYS}-day retention window and dropped)` : '';
+  Logger.log(`Migrated ${migratedRows.length} unique job row(s) into ${CONFIG.NEW_LEADS_SHEET_NAME}${purgedNote}.`);
+  Logger.log('Old consultant tabs left untouched — delete Craig/Alison/Tom/Josh/Ray manually once New Leads looks correct.');
 }
 
 // ==========================================================================
@@ -815,10 +788,10 @@ function loadCompanyRegions(sheet) {
 // ==========================================================================
 // 12-WEEK DATA RETENTION PURGE
 // ==========================================================================
-// isExpired(): shared age check used both by rebuildConsultantTab() (for
-// sectioned tabs) and purgeExpiredRows() (for flat grid tabs). A
-// missing/invalid date is treated as NOT expired — same "safest default"
-// principle as isKeyStale(), so bad data never triggers surprise deletion.
+// isExpired(): shared age check used both by rebuildNewLeadsTab() (for New
+// Leads) and purgeExpiredRows() (for flat grid tabs). A missing/invalid
+// date is treated as NOT expired — same "safest default" principle as
+// isKeyStale(), so bad data never triggers surprise deletion.
 
 function isExpired(dateFound) {
   if (!(dateFound instanceof Date)) return false;
