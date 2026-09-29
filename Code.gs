@@ -1,49 +1,38 @@
 /**
- * JOB ALERT AUTOMATION v19
+ * JOB ALERT AUTOMATION v20
  * ------------------------------------------------------------
- * CHANGES FROM v18 (sheet now feeds a direct CRM import):
- *   - NEW "Staff ID" column on New Leads (column G, after Link). Filled
- *     from the region using the old v17 region -> consultant mapping, but
- *     outputs the consultant's CRM Staff ID instead of their name (see
- *     STAFF_IDS / REGION_TO_STAFF_ID). North West -> Craig only (v17 sent
- *     it to Craig AND Alison; New Leads is one row per job, so it gets
- *     one ID). Rows already in New Leads before v19 keep a blank Staff ID
- *     — no region is stored for them, so there's nothing to derive it
- *     from.
- *   - Staff ID is appended at the END of the row on purpose: Date Found
- *     (E) and Link (F) keep their positions, which dedup, sorting and
- *     the fixed Link column width all depend on. Other keeps its 6-column
- *     layout — New Leads now has its own NEW_LEADS_HEADERS, separate from
- *     the shared TAB_HEADERS that Other still uses.
- *   - NEW "Job Title Blocklist" tab: works exactly like Company
- *     Blocklist, but for job titles. Same normalised exact match (case
- *     and punctuation ignored, whole title must match — "Paralegal"
- *     does NOT block "Senior Paralegal"). Blocked jobs go to Filtered Out
- *     with reason "Job title on blocklist".
- *   - REMOVED (for now) the 30-day resurfacing / high-priority flag. A
- *     job whose title+company+town key already exists in New Leads is
- *     now always treated as a duplicate and dropped, however long ago it
- *     was first seen. Any amber rows already in New Leads lose their
- *     highlight on the first v19 run (the rebuild clears formatting).
- *   - REMOVED (for now) the 84-day retention purge, on every tab. Rows
- *     are kept indefinitely, so Filtered Out / Needs Review dedup is
- *     permanent again.
- *   - Both removals are recoverable from git history (v18 is at commit
- *     c51aff2) if they need to come back.
+ * CHANGES FROM v19:
+ *   - NEW "Unfilter Company" tab (single column, Company). If the AI
+ *     filters a job from a company on this list, the filter is reversed
+ *     and the job routes as normal: New Leads with its region's Staff ID
+ *     (or Other / Needs Review, same rules as any routed job). The AI is
+ *     now asked to give a region for filtered jobs too, so there's a
+ *     region to route with. Only reverses the AI's own "filter" — the
+ *     manual Company / Job Title Blocklists still win over it.
+ *   - A job rescued this way skips the Filtered Out dedup check, so a job
+ *     the AI filtered on an earlier run can still reach New Leads while
+ *     its email is inside LOOKBACK_DAYS. The old Filtered Out row is left
+ *     in place as a record.
+ *   - Bournemouth, Poole and Christchurch now go to Southern Home Counties
+ *     (Ray), not South West. Set in the prompt, like the Peterborough
+ *     exception, and enforced in code (SOUTHERN_HOME_COUNTIES_TOWNS) in
+ *     case the AI still answers South West for them.
+ *   - Daily schedule built into this script: processJobAlerts() runs at
+ *     ~07:30 and runDailySend() emails the workbook at ~08:30 (UK time)
+ *     to DAILY_SEND_CONFIG.RECIPIENT_EMAILS. Set up once with
+ *     createDailyTriggers(). Replaces createDailyTrigger(),
+ *     dailyRunAndSend() and createDailyRunAndSendTrigger().
  *
- * CHANGES FROM v17 (carried forward):
- *   - REMOVED the 5 per-consultant tabs (Craig, Alison, Tom, Josh, Ray).
- *     Every job that used to route to a consultant tab now writes to a
- *     single flat "New Leads" tab instead, sorted newest-first.
- *   - A region that used to fan out to two consultant tabs (North West ->
- *     Craig AND Alison) collapses to exactly one row in New Leads, since
- *     REGION_TO_TABS maps every non-"Other" region to the same tab.
- *   - rebuildNewLeadsTab() rewrites New Leads in full on every run
- *     (read back, merge new rows, dedupe by Link, sort, rewrite), unlike
- *     Other's simpler always-append pattern.
- *   - Added migrateConsultantTabsToNewLeads(), a one-off migration to
- *     pull existing rows out of the old consultant tabs (deduped by
- *     Link) into New Leads, leaving the old tabs in place.
+ * CHANGES FROM v18 (carried forward — sheet now feeds a CRM import):
+ *   - NEW "Staff ID" column on New Leads (column G, after Link), from the
+ *     old v17 region -> consultant mapping but outputting CRM Staff IDs.
+ *     North West -> Craig only. Pre-v19 rows keep a blank Staff ID.
+ *     Appended at the end so Date Found (E) and Link (F) keep the
+ *     positions dedup and sorting rely on; Other keeps 6 columns.
+ *   - NEW "Job Title Blocklist" tab, same normalised exact match as
+ *     Company Blocklist.
+ *   - REMOVED (for now) the 30-day resurfacing flag and the 84-day purge;
+ *     dedup is permanent. Recoverable from git history (v18 = c51aff2).
  */
 
 const CONFIG = {
@@ -54,6 +43,7 @@ const CONFIG = {
   OTHER_SHEET_NAME: 'Other',
   BLOCKLIST_SHEET_NAME: 'Company Blocklist',
   TITLE_BLOCKLIST_SHEET_NAME: 'Job Title Blocklist',
+  UNFILTER_SHEET_NAME: 'Unfilter Company',
   COMPANY_REGIONS_SHEET_NAME: 'Company Regions',
   TORY_EMAIL: '', // TODO: add Tory's email address
   LOOKBACK_DAYS: 4,
@@ -130,6 +120,11 @@ const REVIEW_HEADERS = ['Source', 'Job Title', 'Company', 'Town', 'Date Found', 
 const FILTERED_HEADERS = ['Source', 'Job Title', 'Company', 'Town', 'Date Found', 'Link', 'Filtered Reason'];
 const BLOCKLIST_HEADERS = ['Company'];
 const TITLE_BLOCKLIST_HEADERS = ['Job Title'];
+const UNFILTER_HEADERS = ['Company'];
+
+// Dorset towns BCL treats as Southern Home Counties rather than South West.
+// Mirrors the prompt's exception; applied in code when the AI says South West.
+const SOUTHERN_HOME_COUNTIES_TOWNS = /\b(bournemouth|poole|christchurch)\b/i;
 const COMPANY_REGIONS_HEADERS = ['Company', 'Region'];
 
 // ---- Job link detection (kept deterministic — not handed to the AI) ----------
@@ -160,6 +155,9 @@ function processJobAlerts() {
   const titleBlocklistSheet = getOrCreateSheet(ss, CONFIG.TITLE_BLOCKLIST_SHEET_NAME);
   ensureHeaders(titleBlocklistSheet, TITLE_BLOCKLIST_HEADERS);
   const blockedTitles = loadBlocklist(titleBlocklistSheet);
+  const unfilterSheet = getOrCreateSheet(ss, CONFIG.UNFILTER_SHEET_NAME);
+  ensureHeaders(unfilterSheet, UNFILTER_HEADERS);
+  const unfilterCompanies = loadBlocklist(unfilterSheet);
 
   const companyRegionsSheet = getOrCreateSheet(ss, CONFIG.COMPANY_REGIONS_SHEET_NAME);
   ensureHeaders(companyRegionsSheet, COMPANY_REGIONS_HEADERS);
@@ -182,7 +180,7 @@ function processJobAlerts() {
   ALL_TAB_NAMES.forEach(tabName => { newRowsByTab[tabName] = []; });
   const touchedTabs = new Set();
 
-  let addedCount = 0, filteredCount = 0, reviewCount = 0, skippedEmails = 0, blockedCount = 0, blockedTitleCount = 0, companyRegionOverrideCount = 0;
+  let addedCount = 0, filteredCount = 0, reviewCount = 0, skippedEmails = 0, blockedCount = 0, blockedTitleCount = 0, companyRegionOverrideCount = 0, unfilteredCount = 0;
 
   threads.forEach(thread => {
     thread.getMessages().forEach(msg => {
@@ -200,6 +198,15 @@ function processJobAlerts() {
       jobs.forEach(job => {
         if (!job || !job.title || !job.company || !job.action) return;
 
+        // Unfilter Company reverses the AI's own "filter" so the job routes
+        // as normal, using the region the AI still gives for filtered jobs.
+        // Runs before the blocklists so those manual lists still win.
+        const aiFilteredUnfilterCompany = job.action === 'filter' && unfilterCompanies.has(normalizeText(job.company));
+        if (aiFilteredUnfilterCompany) {
+          job.action = 'route';
+          job.reason = 'Unfilter Company, but AI gave no usable region';
+        }
+
         // Code-level blocklist enforcement — overrides whatever the AI
         // decided. A blocklisted company is ALWAYS filtered, regardless
         // of whether the AI recognised it as an agency/law firm/etc.
@@ -213,6 +220,13 @@ function processJobAlerts() {
           job.action = 'filter';
           job.reason = 'Job title on blocklist';
           blockedTitleCount++;
+        }
+
+        const rescued = aiFilteredUnfilterCompany && job.action === 'route';
+        if (rescued) unfilteredCount++;
+
+        if (job.action === 'route' && job.region === 'South West' && SOUTHERN_HOME_COUNTIES_TOWNS.test(job.town || '')) {
+          job.region = 'Southern Home Counties';
         }
 
         // Company Regions override — only applies to jobs the AI already
@@ -232,9 +246,13 @@ function processJobAlerts() {
         const jobKey = normalizeJobKey(job.title, job.company, town);
 
         // Dedup is permanent: with no purge, a job seen once in Filtered
-        // Out / Needs Review is never reprocessed.
-        if (link && (filteredLinks.has(link) || reviewLinks.has(link))) return;
-        if (filteredKeys.has(jobKey) || reviewKeys.has(jobKey)) return;
+        // Out / Needs Review is never reprocessed. The exception is a job
+        // rescued by Unfilter Company, which skips the Filtered Out check
+        // so a job filtered on an earlier run can still reach New Leads
+        // (its old Filtered Out row is left as a record).
+        const inFiltered = !rescued && ((link && filteredLinks.has(link)) || filteredKeys.has(jobKey));
+        const inReview = (link && reviewLinks.has(link)) || reviewKeys.has(jobKey);
+        if (inFiltered || inReview) return;
 
         if (job.action === 'filter') {
           filteredSheet.appendRow([source, job.title, job.company, town, dateFound, link, job.reason || 'Filtered by AI']);
@@ -296,7 +314,10 @@ function processJobAlerts() {
     autoResizeSheet(sheet);
   });
 
-  Logger.log(`Done. ${addedCount} rows written (${companyRegionOverrideCount} redirected from Other via Company Regions). ${reviewCount} sent to Needs Review. ${filteredCount} filtered out (${blockedCount} due to Company Blocklist, ${blockedTitleCount} due to Job Title Blocklist). ${skippedEmails} email(s) skipped due to API/parse errors.`);
+  // Read by runDailySend() to warn if the morning run didn't complete.
+  PropertiesService.getScriptProperties().setProperty(LAST_PROCESSING_SUCCESS_KEY, todayInSendTimeZone());
+
+  Logger.log(`Done. ${addedCount} rows written (${companyRegionOverrideCount} redirected from Other via Company Regions, ${unfilteredCount} unfiltered via Unfilter Company). ${reviewCount} sent to Needs Review. ${filteredCount} filtered out (${blockedCount} due to Company Blocklist, ${blockedTitleCount} due to Job Title Blocklist). ${skippedEmails} email(s) skipped due to API/parse errors.`);
 }
 
 // ==========================================================================
@@ -433,7 +454,7 @@ TASK: Return a JSON array with one object per job listing found. Each object mus
 - "town": the location/town as written in the email (string, empty string if not shown)
 - "link": the ID from the matching [JOBLINK:ID] marker — just the short code itself, e.g. "L3" — NOT a URL. Empty string if no marker is present for this listing.
 - "action": one of "route", "filter", or "review"
-- "region": required if action is "route", must be exactly one of: ${REGIONS.join(', ')}
+- "region": must be exactly one of: ${REGIONS.join(', ')}. Required if action is "route". If action is "filter", still give the region the location maps to using the same rules below (empty string if it genuinely can't be placed) — it is used if the filter is overridden. Empty string if action is "review".
 - "reason": required if action is "filter" or "review", short plain-English reason (string)
 
 FILTERING RULES (action = "filter"):
@@ -442,13 +463,14 @@ FILTERING RULES (action = "filter"):
 - Councils and local authorities (borough/county/city/district councils)
 - General recruitment/staffing agencies
 
-REGION ASSIGNMENT (action = "route"):
+REGION ASSIGNMENT:
 Assign the town/location to exactly one region from this list, using this guidance:
 - Scotland, North East, Yorkshire, North West, West Midlands, East Midlands, London, South West, Ireland — standard UK regions/postcode areas
 - East Anglia — Norfolk, Suffolk, Cambridgeshire, Essex only (e.g. Cambridge, Norwich, Ipswich, Chelmsford, Colchester, Ely)
   - EXCEPTION: Peterborough is classified as East Midlands, NOT East Anglia, even though it sits in Cambridgeshire. Always route Peterborough to East Midlands.
 - Northern Home Counties — Oxfordshire, Buckinghamshire, Bedfordshire, Hertfordshire (e.g. Oxford, Milton Keynes, Luton, St Albans, Watford)
 - Southern Home Counties — Surrey, Kent, Sussex, Hampshire, Berkshire (e.g. Reading, Guildford, Brighton, Southampton, Portsmouth)
+  - EXCEPTION: Bournemouth, Poole and Christchurch are classified as Southern Home Counties, NOT South West, even though they sit in Dorset. Always route them to Southern Home Counties.
 - Other — use this confidently (do NOT send to review) for: Remote, UK-wide, Nationwide, Work From Home, "United Kingdom", or any listing where the location is clearly national/non-specific rather than tied to a real town. These should always be routed to Other, never sent to review.
 
 If the town is genuinely ambiguous, unrecognisable, or missing in a way that ISN'T covered by the Other rule above, use action "review" with a reason instead of guessing.
@@ -898,15 +920,6 @@ function sendCopyToTory() {
 }
 
 // ==========================================================================
-// TRIGGER SETUP (unchanged)
-// ==========================================================================
-
-function createDailyTrigger() {
-  ScriptApp.newTrigger('processJobAlerts').timeBased().everyDays(1).atHour(7).create();
-  Logger.log('Daily trigger created for 7am.');
-}
-
-// ==========================================================================
 // TEST HELPER — dry run, logs API output, writes nothing
 // ==========================================================================
 
@@ -934,73 +947,67 @@ function testParseLatestEmail() {
       const staffId = REGION_TO_STAFF_ID[j.region] || '(none)';
       Logger.log(`${i + 1}. ${j.title} | ${j.company} | ${j.town} | ${link} -> ROUTE [${j.region} -> ${tabs}, Staff ID ${staffId}]`);
     } else {
-      Logger.log(`${i + 1}. ${j.title} | ${j.company} | ${j.town} | ${link} -> ${j.action.toUpperCase()} (${j.reason})`);
+      const regionNote = j.action === 'filter' ? ` [region if unfiltered: ${j.region || '(none)'}]` : '';
+      Logger.log(`${i + 1}. ${j.title} | ${j.company} | ${j.town} | ${link} -> ${j.action.toUpperCase()} (${j.reason})${regionNote}`);
     }
   });
 }
+
 // ==========================================================================
-// DAILY RUN + SEND  (add-on for the COPY of the master sheet)
+// DAILY SCHEDULE — process ~07:30, email the workbook ~08:30 (UK time)
 // ==========================================================================
-// Paste this block at the BOTTOM of Code.gs on the copy. It adds nothing
-// to and changes nothing in the existing script — it just wraps
-// processJobAlerts() and an email send into one scheduled run.
+// Two time-based triggers:
+//   processJobAlerts() ~07:30 — pulls the latest alerts into the sheet
+//   runDailySend()     ~08:30 — emails the workbook (.xlsx) to RECIPIENT_EMAILS
+// Google fires these within ±15 minutes of the set minute, so the two runs
+// are always at least 30 minutes apart — far longer than processing takes
+// (Apps Script stops any run after 6 minutes).
 //
-// WHY ONE TRIGGER, NOT TWO:
-//   Apps Script gives no ordering guarantee between two triggers set for
-//   the same time. Two separate 7am triggers would periodically email
-//   yesterday's sheet because the send fired before processing finished.
-//   One wrapper function running both steps in sequence removes that
-//   race entirely.
+// The email is sent even if that morning's processing failed, with a
+// warning in the subject and body, so a failure can't go unnoticed.
+// processJobAlerts() records the date of its last successful run in
+// Script Properties, and runDailySend() checks it.
 //
-// SETUP (three steps, once):
-//   1. Run dailyRunAndSend() manually — this fires the Google
-//      authorisation prompt and confirms the whole chain works end to end.
-//   2. Check the email actually arrived with today's data in it.
-//   3. Run createDailyRunAndSendTrigger() once. Done.
-//
-// NOTE ON TIMING: "7am" means the trigger fires somewhere in the 7–8am
-// window. Apps Script time-based triggers aren't exact. Arrival drifting
-// to 7:40 is normal, not a fault.
+// SETUP (once, from the Apps Script editor):
+//   1. Run processJobAlerts(), then runDailySend(). The first run asks for
+//      permission to send email; check the email arrives with today's data.
+//   2. Run createDailyTriggers(). It deletes any existing schedule triggers
+//      first — including the old processJobAlerts / dailyRunAndSend ones —
+//      so running it again never leaves duplicates.
+//   3. Run listAllTriggers() to confirm exactly two triggers exist.
 
 const DAILY_SEND_CONFIG = {
-  RECIPIENT_EMAIL: 'marklevine@bcllegal.com',
-  SEND_HOUR: 7, // 24-hour clock; trigger fires within this hour
+  RECIPIENT_EMAILS: ['valeriiamuzhchyna@bcllegal.com', 'marklevine@bcllegal.com'],
+  TIME_ZONE: 'Europe/London',
+  PROCESS_HOUR: 7,
+  PROCESS_MINUTE: 30,
+  SEND_HOUR: 8,
+  SEND_MINUTE: 30,
   SUBJECT_PREFIX: 'Job Alerts Sheet'
 };
 
-// ==========================================================================
-// THE SCHEDULED FUNCTION
-// ==========================================================================
-// Runs processing first, then sends. If processing throws, the send still
-// happens with a warning noted in the email body — a silent failure while
-// nobody's watching is worse than a sheet that arrives flagged.
+const LAST_PROCESSING_SUCCESS_KEY = 'LAST_PROCESSING_SUCCESS_DATE';
 
-function dailyRunAndSend() {
-  let processingError = null;
+// Every handler any version of this script has scheduled, so a cleanup
+// catches triggers left over from before v20.
+const SCHEDULE_HANDLERS = ['processJobAlerts', 'runDailySend', 'dailyRunAndSend'];
 
-  try {
-    processJobAlerts();
-  } catch (err) {
-    processingError = err;
-    Logger.log(`processJobAlerts() failed: ${err}. Sending the sheet anyway, with a warning in the email body.`);
-  }
-
-  // Apps Script batches spreadsheet writes. Without this, the .xlsx
-  // export can be taken BEFORE the new rows have actually committed —
-  // the classic cause of "the email arrived but the new jobs weren't in
-  // it". Forces everything to disk before we export.
-  SpreadsheetApp.flush();
-
-  sendSheetCopy(processingError);
+function todayInSendTimeZone() {
+  return Utilities.formatDate(new Date(), DAILY_SEND_CONFIG.TIME_ZONE, 'yyyy-MM-dd');
 }
 
-// ==========================================================================
-// EMAIL SEND
-// ==========================================================================
+function runDailySend() {
+  const lastSuccess = PropertiesService.getScriptProperties().getProperty(LAST_PROCESSING_SUCCESS_KEY);
+  const warning = lastSuccess === todayInSendTimeZone()
+    ? null
+    : `this morning's processing run did not complete (last successful run: ${lastSuccess || 'never'}).`;
+  sendSheetCopy(warning);
+}
 
-function sendSheetCopy(processingError) {
+function sendSheetCopy(warning) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const dateStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy');
+  const dateStr = Utilities.formatDate(new Date(), DAILY_SEND_CONFIG.TIME_ZONE, 'dd/MM/yyyy');
+  const recipients = DAILY_SEND_CONFIG.RECIPIENT_EMAILS.join(',');
 
   let blob;
   try {
@@ -1022,71 +1029,76 @@ function sendSheetCopy(processingError) {
   }
 
   let body = 'Attached is today\'s updated job alerts workbook.\n\nThis is an automated daily send.';
-  if (processingError) {
-    body = 'WARNING: today\'s job processing did not complete successfully, so this sheet may not include the latest listings.\n\n'
-      + `Error: ${processingError}\n\n`
+  if (warning) {
+    body = `WARNING: ${warning} This sheet may not include the latest listings.\n\n`
       + 'The workbook is attached as it currently stands.';
   }
 
   try {
     MailApp.sendEmail({
-      to: DAILY_SEND_CONFIG.RECIPIENT_EMAIL,
-      subject: `${DAILY_SEND_CONFIG.SUBJECT_PREFIX} — ${dateStr}${processingError ? ' (processing error)' : ''}`,
+      to: recipients,
+      subject: `${DAILY_SEND_CONFIG.SUBJECT_PREFIX} — ${dateStr}${warning ? ' (processing error)' : ''}`,
       body: body,
       attachments: [blob]
     });
-    Logger.log(`Sent workbook to ${DAILY_SEND_CONFIG.RECIPIENT_EMAIL} (${dateStr}).`);
+    Logger.log(`Sent workbook to ${recipients} (${dateStr}).`);
   } catch (err) {
     Logger.log(`Failed to send email: ${err}`);
   }
 }
 
 // ==========================================================================
-// TRIGGER SETUP
+// SCHEDULE SETUP
 // ==========================================================================
-// Clears any existing dailyRunAndSend trigger first, so running this
-// twice can't leave you with two triggers and two runs a day.
 
-function createDailyRunAndSendTrigger() {
-  const existing = ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'dailyRunAndSend');
-  existing.forEach(t => ScriptApp.deleteTrigger(t));
-  if (existing.length > 0) {
-    Logger.log(`Removed ${existing.length} existing dailyRunAndSend trigger(s) before recreating.`);
-  }
+function createDailyTriggers() {
+  const removed = deleteScheduleTriggers();
+  if (removed > 0) Logger.log(`Removed ${removed} existing schedule trigger(s) before recreating.`);
 
-  ScriptApp.newTrigger('dailyRunAndSend')
+  const c = DAILY_SEND_CONFIG;
+  ScriptApp.newTrigger('processJobAlerts')
     .timeBased()
+    .atHour(c.PROCESS_HOUR)
+    .nearMinute(c.PROCESS_MINUTE)
     .everyDays(1)
-    .atHour(DAILY_SEND_CONFIG.SEND_HOUR)
+    .inTimezone(c.TIME_ZONE)
+    .create();
+  ScriptApp.newTrigger('runDailySend')
+    .timeBased()
+    .atHour(c.SEND_HOUR)
+    .nearMinute(c.SEND_MINUTE)
+    .everyDays(1)
+    .inTimezone(c.TIME_ZONE)
     .create();
 
-  Logger.log(`Daily run+send trigger created for ~${DAILY_SEND_CONFIG.SEND_HOUR}:00. Recipient: ${DAILY_SEND_CONFIG.RECIPIENT_EMAIL}`);
+  Logger.log(`Daily triggers created (${c.TIME_ZONE}): processing ~${c.PROCESS_HOUR}:${c.PROCESS_MINUTE}, send ~${c.SEND_HOUR}:${c.SEND_MINUTE} to ${c.RECIPIENT_EMAILS.join(', ')}.`);
+}
+
+// Turns off the automated daily processing and send without deleting code.
+function removeDailyTriggers() {
+  Logger.log(`Removed ${deleteScheduleTriggers()} trigger(s). Automated daily processing and send are now off.`);
+}
+
+function deleteScheduleTriggers() {
+  const existing = ScriptApp.getProjectTriggers()
+    .filter(t => SCHEDULE_HANDLERS.includes(t.getHandlerFunction()));
+  existing.forEach(t => ScriptApp.deleteTrigger(t));
+  return existing.length;
 }
 
 // ==========================================================================
 // DIAGNOSTICS
 // ==========================================================================
 
-// Copying a Google Sheet copies the bound script but NOT its triggers, so
-// this copy starts with none. Run this after setup to confirm exactly
-// what's scheduled — and to check you haven't accidentally got a leftover
-// standalone processJobAlerts() trigger running alongside the wrapper,
-// which would double-process.
+// Copying a Google Sheet copies the bound script but NOT its triggers, so a
+// copy starts with none. Run this after setup to confirm exactly what's
+// scheduled on this sheet's script.
 function listAllTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   if (triggers.length === 0) {
-    Logger.log('No triggers currently set on this copy.');
+    Logger.log('No triggers currently set on this script.');
     return;
   }
-  Logger.log(`${triggers.length} trigger(s) on this copy:`);
+  Logger.log(`${triggers.length} trigger(s) on this script:`);
   triggers.forEach(t => Logger.log(`  - ${t.getHandlerFunction()} (${t.getEventType()})`));
-}
-
-// Turns off the automated daily run without deleting any code.
-function removeDailyRunAndSendTrigger() {
-  const existing = ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'dailyRunAndSend');
-  existing.forEach(t => ScriptApp.deleteTrigger(t));
-  Logger.log(`Removed ${existing.length} trigger(s). Automated daily run+send is now off.`);
 }

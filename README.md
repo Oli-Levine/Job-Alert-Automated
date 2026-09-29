@@ -4,7 +4,29 @@ This repo holds a single Google Apps Script file, **`Code.gs`**, that automates 
 
 > Earlier on, this project renamed the file itself on every rewrite (`V17` → `V18`). That's retired: it duplicated what git already tracks for free, and made it easy to lose track of where an old version went. This doc exists to cover the versions from before that retirement; going forward, `git log` and the header comment's changelog are enough.
 
-## v19 — current (`Code.gs`)
+## v20 — current (`Code.gs`)
+
+**New `Unfilter Company` tab.** For companies the AI filters out by mistake. If the AI filters a job from a company on this list, the job goes to New Leads as normal, with the right consultant's Staff ID. You fill the list in yourself, and matching works the same way as the blocklists: exact, ignoring case and punctuation.
+- If the AI can't place the job's location, it goes to `Needs Review` instead ("Unfilter Company, but AI gave no usable region"). Remote/UK-wide jobs go to `Other`, same as any other job.
+- The manual `Company Blocklist` and `Job Title Blocklist` still win. A company on both Unfilter and the blocklist stays filtered, and so does a blocklisted job title at an unfiltered company.
+- Jobs the AI already filtered on an earlier run come back into New Leads on the next run, provided their email is still within the 4-day lookback. Their old `Filtered Out` row stays as a record. Older jobs won't come back.
+
+**Bournemouth, Poole and Christchurch → Southern Home Counties (Ray),** not South West (Josh). The AI is told this, and the script also corrects it if the AI still says South West.
+
+**Daily schedule.** Every day, UK time:
+- **~7:30:** the sheet pulls in the latest job alerts.
+- **~8:30:** the workbook is emailed as an `.xlsx` to `valeriiamuzhchyna@bcllegal.com` and `marklevine@bcllegal.com`.
+
+Google runs each one within 15 minutes either side of the set time. If the 7:30 run failed, the 8:30 email still goes out, marked "(processing error)" with a warning, so a failure can't go unnoticed.
+
+**One-time setup, in the Apps Script editor, after pasting in `Code.gs`:**
+1. Run `processJobAlerts`, then `runDailySend`. Google will ask for permission to send email the first time. Check the email arrives.
+2. Run `createDailyTriggers`. This sets up the 7:30 and 8:30 runs and removes any older schedule, so it's safe to run again.
+3. Run `listAllTriggers` and check there are exactly two triggers: `processJobAlerts` and `runDailySend`.
+
+To stop the schedule, run `removeDailyTriggers`.
+
+## v19 — superseded (`git show fc363a5:Code.gs`)
 
 The sheet's end goal is now a **direct import into the company CRM**.
 
