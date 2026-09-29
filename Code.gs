@@ -19,7 +19,9 @@
  *     case the AI still answers South West for them.
  *   - Daily schedule built into this script: processJobAlerts() runs at
  *     ~07:30 and runDailySend() emails the workbook at ~08:30 (UK time)
- *     to DAILY_SEND_CONFIG.RECIPIENT_EMAILS. Set up once with
+ *     to DAILY_SEND_CONFIG.RECIPIENT_EMAILS, as an .xlsx attachment plus
+ *     a link to the live Google Sheet (recipients are given viewer
+ *     access so the link opens). Set up once with
  *     createDailyTriggers(). Replaces createDailyTrigger(),
  *     dailyRunAndSend() and createDailyRunAndSendTrigger().
  *
@@ -958,7 +960,8 @@ function testParseLatestEmail() {
 // ==========================================================================
 // Two time-based triggers:
 //   processJobAlerts() ~07:30 — pulls the latest alerts into the sheet
-//   runDailySend()     ~08:30 — emails the workbook (.xlsx) to RECIPIENT_EMAILS
+//   runDailySend()     ~08:30 — emails the workbook (.xlsx) plus a link to the
+//                                live sheet to RECIPIENT_EMAILS
 // Google fires these within ±15 minutes of the set minute, so the two runs
 // are always at least 30 minutes apart — far longer than processing takes
 // (Apps Script stops any run after 6 minutes).
@@ -1028,10 +1031,19 @@ function sendSheetCopy(warning) {
     return;
   }
 
-  let body = 'Attached is today\'s updated job alerts workbook.\n\nThis is an automated daily send.';
+  // Viewer access so the live link opens for every recipient. Anyone who
+  // already has edit access keeps it (addViewers never downgrades).
+  try {
+    ss.addViewers(DAILY_SEND_CONFIG.RECIPIENT_EMAILS);
+  } catch (err) {
+    Logger.log(`Couldn't share the sheet with the recipients (${err}) — the live link may not open for them until it's shared by hand.`);
+  }
+
+  const liveLink = `Live sheet (always up to date): ${ss.getUrl()}`;
+  let body = `Attached is today's updated job alerts workbook.\n\n${liveLink}\n\nThis is an automated daily send.`;
   if (warning) {
     body = `WARNING: ${warning} This sheet may not include the latest listings.\n\n`
-      + 'The workbook is attached as it currently stands.';
+      + `The workbook is attached as it currently stands.\n\n${liveLink}`;
   }
 
   try {

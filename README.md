@@ -15,7 +15,7 @@ This repo holds a single Google Apps Script file, **`Code.gs`**, that automates 
 
 **Daily schedule.** Every day, UK time:
 - **~7:30:** the sheet pulls in the latest job alerts.
-- **~8:30:** the workbook is emailed as an `.xlsx` to `valeriiamuzhchyna@bcllegal.com` and `marklevine@bcllegal.com`.
+- **~8:30:** the workbook is emailed to `valeriiamuzhchyna@bcllegal.com` and `marklevine@bcllegal.com`. It's attached as an `.xlsx` (a snapshot for the CRM import), and the email also has a link to the live Google Sheet. Both recipients are given view access so the link opens; anyone who can already edit keeps edit access.
 
 Google runs each one within 15 minutes either side of the set time. If the 7:30 run failed, the 8:30 email still goes out, marked "(processing error)" with a warning, so a failure can't go unnoticed.
 
