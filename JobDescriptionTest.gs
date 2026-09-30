@@ -14,15 +14,20 @@
  *      sites) and writes the FULL job description into the sheet — no
  *      Claude call, no summarising.
  *      - LinkedIn: uses LinkedIn's public guest job page (no login).
- *      - Indeed: uses the job's viewjob page. If Indeed blocks the
- *        download, falls back to a 2-line summary Claude wrote in step 1
- *        from the snippet in the alert email (if the email had one).
+ *      - Indeed: tries the job's viewjob page, but Indeed usually blocks
+ *        it (401/403). Then:
+ *          a. Claude web-searches for the same job posted elsewhere
+ *             (company careers page, Reed, Totaljobs...) and returns the
+ *             description it finds, labelled with where it came from.
+ *          b. If that finds nothing, a 2-line summary Claude wrote in
+ *             step 1 from the alert email snippet (if there was one).
  *
  * OUTPUT: a single "JD Test" tab — Company | Location | Date | Job Description | Link
  *   - Date is the date the alert email arrived (same as V17's Date Found).
  *   - Nothing is guessed. The description cell says one of these instead:
  *       FETCH FAILED (<reason>)  — page couldn't be downloaded (and, for
- *                                  Indeed, the email had no snippet either)
+ *                                  Indeed, web search and the email snippet
+ *                                  found nothing either)
  *       NO LINK FOUND IN EMAIL   — job with no link to fetch
  *
  * SETUP:
@@ -92,10 +97,13 @@ function testJobDescriptions() {
           description = jdLinkedInDescription(url);
         } else {
           description = jdIndeedDescription(url);
-          // Indeed often blocks bots — fall back to the email snippet summary.
-          const emailSummary = job.description && job.description !== 'NO DESCRIPTION IN EMAIL' ? job.description : '';
-          if (description.startsWith('FETCH FAILED') && emailSummary) {
-            description = `[From alert email — ${description}] ${emailSummary}`;
+          // Indeed usually blocks the download — try web search, then the
+          // email snippet summary.
+          if (description.startsWith('FETCH FAILED')) {
+            const found = jdSearchDescription(job);
+            const emailSummary = job.description && job.description !== 'NO DESCRIPTION IN EMAIL' ? job.description : '';
+            if (found) description = `[Via web search: ${found.sourceUrl}]\n${found.description}`;
+            else if (emailSummary) description = `[From alert email — ${description}] ${emailSummary}`;
           }
         }
         if (JD_FAILURE_PREFIXES.some(p => description.startsWith(p))) failed++;
@@ -223,6 +231,74 @@ function jdDivContents(html, marker) {
     if (depth === 0) return html.substring(start, tag.index);
   }
   return html.substring(start);
+}
+
+// ==========================================================================
+// STEP 3 (Indeed fallback) — find the same job elsewhere via web search
+// ==========================================================================
+
+// Returns { description, sourceUrl } or null if no matching posting was
+// found (reason logged). Uses Claude's server-side web search tool.
+function jdSearchDescription(job) {
+  const prompt = `Find the full job description for this job posting by searching the web. It was advertised on Indeed, but Indeed can't be used — look for the same job on the employer's own careers site or another job board (e.g. Reed, Totaljobs, CV-Library, Guardian Jobs).
+
+Job title: ${job.title}
+Company: ${job.company}
+Location: ${job.town || 'not given'}
+
+Only accept a posting that is clearly the SAME job: same company, same or near-identical title, and a matching location if one is given. A different role at the same company does not count.
+
+Reply with ONLY a JSON object, no other text:
+- If found: {"found": true, "description": "<the job description, as complete as the search results allow — keep the original wording, use \\n for line breaks>", "source_url": "<URL of the page it came from>"}
+- If not found: {"found": false, "reason": "<short reason>"}
+
+Never write a description from the job title alone or from a different job.`;
+
+  const messages = [{ role: 'user', content: prompt }];
+  const tools = [{
+    type: 'web_search_20250305', // the web search version Haiku 4.5 supports
+    name: 'web_search',
+    max_uses: 3,
+    user_location: { type: 'approximate', country: 'GB' }
+  }];
+
+  // Server tools can end a turn with stop_reason "pause_turn" — resend the
+  // conversation so far and Claude picks up where it left off.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const data = jdCallClaude({ max_tokens: 4096, tools: tools, messages: messages });
+    if (!data) return null;
+
+    if (data.stop_reason === 'pause_turn') {
+      messages.push({ role: 'assistant', content: data.content });
+      continue;
+    }
+
+    (data.content || [])
+      .filter(b => b.type === 'web_search_tool_result' && b.content && b.content.error_code)
+      .forEach(b => Logger.log(`Web search error for ${job.company}: ${b.content.error_code}`));
+
+    // Any "let me search..." preamble comes before the JSON, so take the
+    // span from the first { to the last }.
+    const text = jdText(data.content);
+    const start = text.indexOf('{'), end = text.lastIndexOf('}');
+    try {
+      const result = JSON.parse(text.substring(start, end + 1));
+      if (!result.found || !result.description) {
+        Logger.log(`Web search found no match for ${job.title} at ${job.company}: ${result.reason || 'no reason given'}`);
+        return null;
+      }
+      let description = String(result.description).trim();
+      if (description.length > JD_CONFIG.MAX_DESCRIPTION_CHARS) {
+        description = description.substring(0, JD_CONFIG.MAX_DESCRIPTION_CHARS) + ' …(truncated)';
+      }
+      return { description: description, sourceUrl: result.source_url || 'unknown source' };
+    } catch (err) {
+      Logger.log(`Failed to parse web search reply for ${job.company}: ${err}. Raw (first 500 chars): ${text.substring(0, 500)}`);
+      return null;
+    }
+  }
+  Logger.log(`Web search for ${job.company} hit too many pause_turn continuations.`);
+  return null;
 }
 
 // ==========================================================================
