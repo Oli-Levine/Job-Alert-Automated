@@ -9,20 +9,21 @@
  * HOW IT WORKS:
  *   1. One Claude call per email pulls out each job's company, location
  *      and link (same [JOBLINK:ID] placeholder trick as V17).
- *   2. The description depends on the source:
- *      - Indeed: Claude writes it in that same call, from the snippet
- *        shown under each job in the alert email. No extra cost.
- *      - LinkedIn: alert emails carry no description, so the script
- *        downloads LinkedIn's public guest job page itself (Claude's own
- *        web fetch tool is blocked from LinkedIn), then one Claude call
- *        per job summarises it.
+ *   2. For each job the script downloads the job page itself with
+ *      UrlFetchApp (Claude's own web fetch tool is blocked from these
+ *      sites) and writes the FULL job description into the sheet — no
+ *      Claude call, no summarising.
+ *      - LinkedIn: uses LinkedIn's public guest job page (no login).
+ *      - Indeed: uses the job's viewjob page. If Indeed blocks the
+ *        download, falls back to a 2-line summary Claude wrote in step 1
+ *        from the snippet in the alert email (if the email had one).
  *
  * OUTPUT: a single "JD Test" tab — Company | Location | Date | Job Description | Link
  *   - Date is the date the alert email arrived (same as V17's Date Found).
  *   - Nothing is guessed. The description cell says one of these instead:
- *       FETCH FAILED (<reason>)  — LinkedIn page couldn't be downloaded
- *       NO DESCRIPTION IN EMAIL  — Indeed snippet had nothing useful
- *       NO LINK FOUND IN EMAIL   — LinkedIn job with no link to fetch
+ *       FETCH FAILED (<reason>)  — page couldn't be downloaded (and, for
+ *                                  Indeed, the email had no snippet either)
+ *       NO LINK FOUND IN EMAIL   — job with no link to fetch
  *
  * SETUP:
  *   - Safe to paste into the same Apps Script project as V17: every
@@ -36,13 +37,14 @@ const JD_CONFIG = {
   SENDER_EMAIL: 'marklevine@bcllegal.com',
   SHEET_NAME: 'JD Test',
   LOOKBACK_DAYS: 4,
-  MAX_JOBS: 10, // cap per run — each LinkedIn job is one page download + one API call
+  MAX_JOBS: 10, // cap per run — each job is one page download
   CLAUDE_API_URL: 'https://api.anthropic.com/v1/messages',
-  CLAUDE_MODEL: 'claude-haiku-4-5' // same cheap model as V17 — plenty for summarising text
+  CLAUDE_MODEL: 'claude-haiku-4-5', // same cheap model as V17 — only used to read the emails now
+  MAX_DESCRIPTION_CHARS: 45000 // a Sheets cell holds 50,000 characters at most
 };
 
 // Failure markers written to the description cell (counted as "failed").
-const JD_FAILURE_PREFIXES = ['FETCH FAILED', 'NO DESCRIPTION', 'NO LINK'];
+const JD_FAILURE_PREFIXES = ['FETCH FAILED', 'NO LINK'];
 
 const JD_HEADERS = ['Company', 'Location', 'Date', 'Job Description', 'Link'];
 
@@ -84,15 +86,22 @@ function testJobDescriptions() {
 
         const url = linkMap[job.link] || '';
         let description;
-        if (source === 'Indeed') {
-          description = job.description || 'NO DESCRIPTION IN EMAIL';
+        if (!url) {
+          description = 'NO LINK FOUND IN EMAIL';
+        } else if (source === 'LinkedIn') {
+          description = jdLinkedInDescription(url);
         } else {
-          description = url ? jdLinkedInDescription(job.title, job.company, url) : 'NO LINK FOUND IN EMAIL';
+          description = jdIndeedDescription(url);
+          // Indeed often blocks bots — fall back to the email snippet summary.
+          const emailSummary = job.description && job.description !== 'NO DESCRIPTION IN EMAIL' ? job.description : '';
+          if (description.startsWith('FETCH FAILED') && emailSummary) {
+            description = `[From alert email — ${description}] ${emailSummary}`;
+          }
         }
         if (JD_FAILURE_PREFIXES.some(p => description.startsWith(p))) failed++;
         else described++;
 
-        Logger.log(`${job.company} | ${job.town} | ${url}\n  -> ${description}`);
+        Logger.log(`${job.company} | ${job.town} | ${url}\n  -> ${description.substring(0, 150)}`);
         rows.push([job.company, job.town || '', msg.getDate(), description, url]);
       }
     }
@@ -108,6 +117,7 @@ function testJobDescriptions() {
   sheet.autoResizeColumns(1, 3);
   sheet.setColumnWidth(4, 500);
   sheet.setColumnWidth(5, 150); // full URLs are unreadable when auto-sized
+  sheet.getRange(1, 1, rows.length + 1, JD_HEADERS.length).setVerticalAlignment('top');
   sheet.getRange(1, 4, rows.length + 1, 1).setWrap(true);
 
   Logger.log(`Done. ${rows.length} jobs written — ${described} with descriptions, ${failed} without.`);
@@ -118,8 +128,8 @@ function testJobDescriptions() {
 // ==========================================================================
 
 // For Indeed emails, also asks for a 2-line "description" per job, written
-// from the snippet under each listing. LinkedIn emails have no snippet, so
-// that field is left out and filled in later by jdLinkedInDescription().
+// from the snippet under each listing — only used as a fallback if the
+// Indeed page itself can't be downloaded. LinkedIn emails have no snippet.
 function jdExtractJobs(emailText, source) {
   const descriptionField = source === 'Indeed'
     ? `\n- "description": a job description of at most 2 short lines (roughly 40 words) covering what the role is and its key responsibilities or requirements, written ONLY from the text shown under this job in the email. Never guess from the job title. If the email shows nothing useful for this job (e.g. only salary or "Easily apply"), use exactly "NO DESCRIPTION IN EMAIL".`
@@ -156,51 +166,63 @@ ${emailText}`;
 }
 
 // ==========================================================================
-// STEP 2 (LinkedIn only) — download the job page and summarise it
+// STEP 2 — download the job page and pull out the full description
 // ==========================================================================
 
-// LinkedIn's guest endpoint returns the public job page (description
-// included) without a login. Apps Script downloads it with UrlFetchApp,
-// then Claude summarises the text — no Claude web fetch tool involved.
-function jdLinkedInDescription(title, company, url) {
+// LinkedIn's guest endpoint returns the public job page without a login.
+function jdLinkedInDescription(url) {
   const idMatch = url.match(/\/jobs\/view\/(\d+)/);
   if (!idMatch) return 'FETCH FAILED (no job ID in link)';
+  return jdDownloadDescription(
+    `https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/${idMatch[1]}`,
+    /show-more-less-html__markup/, 'LinkedIn');
+}
 
+function jdIndeedDescription(url) {
+  return jdDownloadDescription(url, /id="jobDescriptionText"/, 'Indeed');
+}
+
+// Downloads pageUrl and returns the plain text of the <div> whose opening
+// tag matches marker (the site's job description block), or a
+// "FETCH FAILED (...)" string saying why not.
+function jdDownloadDescription(pageUrl, marker, site) {
   let response;
   try {
-    response = UrlFetchApp.fetch(`https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/${idMatch[1]}`, {
-      muteHttpExceptions: true,
-      followRedirects: true
-    });
+    response = UrlFetchApp.fetch(pageUrl, { muteHttpExceptions: true, followRedirects: true });
   } catch (err) {
-    Logger.log(`LinkedIn download failed for ${url}: ${err}`);
+    Logger.log(`${site} download failed for ${pageUrl}: ${err}`);
     return 'FETCH FAILED (download error — see logs)';
   }
 
   const code = response.getResponseCode();
-  if (code !== 200) return `FETCH FAILED (LinkedIn returned status ${code})`;
+  if (code !== 200) return `FETCH FAILED (${site} returned status ${code})`;
 
-  // The description sits in the "show-more-less-html__markup" block; fall
-  // back to the whole page if LinkedIn ever changes that class name.
-  const html = response.getContentText();
-  const block = html.match(/<div[^>]*show-more-less-html__markup[^>]*>([\s\S]*?)<\/div>/i);
-  const pageText = jdHtmlToText(block ? block[1] : html).substring(0, 15000);
-  if (pageText.length < 50) return 'FETCH FAILED (page had no description text)';
+  const block = jdDivContents(response.getContentText(), marker);
+  if (block === null) return `FETCH FAILED (no description block on ${site} page — likely a block/captcha page)`;
 
-  const prompt = `Below is the text of a job posting for "${title}" at ${company}.
+  let text = jdHtmlToText(block);
+  if (text.length < 50) return `FETCH FAILED (${site} description was empty)`;
+  if (text.length > JD_CONFIG.MAX_DESCRIPTION_CHARS) {
+    text = text.substring(0, JD_CONFIG.MAX_DESCRIPTION_CHARS) + ' …(truncated)';
+  }
+  return text;
+}
 
-Write a job description of at most 2 short lines (roughly 40 words total) covering what the role is and its key responsibilities or requirements. Base it ONLY on the text below — never guess from the job title.
-
-If the text doesn't contain a job description, reply with exactly: FETCH FAILED (no description on page)
-
-Reply with ONLY the description (or the FETCH FAILED line) — no preamble.
-
-JOB POSTING TEXT:
-${pageText}`;
-
-  const data = jdCallClaude({ max_tokens: 1024, messages: [{ role: 'user', content: prompt }] });
-  if (!data) return 'FETCH FAILED (API error — see logs)';
-  return jdText(data.content) || 'FETCH FAILED (empty response)';
+// Returns the inner HTML of the first <div> whose opening tag matches
+// marker, counting nested <div>s so the whole block is kept. null if the
+// marker isn't on the page.
+function jdDivContents(html, marker) {
+  const m = marker.exec(html);
+  if (!m) return null;
+  const start = html.indexOf('>', m.index) + 1;
+  const divTag = /<(\/?)div\b[^>]*>/gi;
+  divTag.lastIndex = start;
+  let depth = 1, tag;
+  while ((tag = divTag.exec(html))) {
+    depth += tag[1] ? -1 : 1;
+    if (depth === 0) return html.substring(start, tag.index);
+  }
+  return html.substring(start);
 }
 
 // ==========================================================================
@@ -295,15 +317,20 @@ function jdPrepareEmail(html) {
 function jdHtmlToText(html) {
   return html
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(p|div|td|tr|li)>/gi, '\n')
+    .replace(/<li\b[^>]*>/gi, '\n• ')
+    .replace(/<\/?(p|div|td|tr|li|ul|ol|h[1-6])\b[^>]*>/gi, '\n')
     .replace(/<[^>]+>/g, '')
     .replace(/&nbsp;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(Number(d)))
     .replace(/&amp;/gi, '&')
-    .replace(/&#39;/g, "'")
-    .replace(/&quot;/g, '"')
-    .replace(/&#8203;|\u200b/g, '')
+    .replace(/\u200b/g, '')
     .replace(/\u034f/g, '')
-    .replace(/\n\s*\n+/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{2,}/g, '\n')
     .trim();
 }
 
