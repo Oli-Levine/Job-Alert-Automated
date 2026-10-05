@@ -1131,25 +1131,14 @@ function finishApifyRun(token, run, deadline) {
   const failAll = reason => new Map(run.jks.map(jk => [jk, `${DESCRIPTION_FAILED} (${reason})`]));
   if (!token) return failAll('APIFY_TOKEN not set in Script Properties');
   const stale = Date.now() - run.startedAt > DESCRIPTION_CONFIG.APIFY_STALE_HOURS * 60 * 60 * 1000;
-  const unfinished = s => s === 'READY' || s === 'RUNNING';
 
-  let status = 'RUNNING';
-  do {
-    // waitForFinish holds the request open (max 45s, inside UrlFetchApp's limit).
-    const wait = Math.max(0, Math.min(45, Math.floor((deadline - Date.now()) / 1000)));
-    const poll = apifyRequest(token, 'get', `/actor-runs/${run.runId}?waitForFinish=${wait}`);
-    if (poll.error) return stale ? failAll(poll.error) : null;
-    status = poll.data.status;
-  } while (unfinished(status) && Date.now() < deadline && timeLeftMs() > 60 * 1000);
-
-  if (unfinished(status)) {
+  const res = apifyRunItems(token, run, deadline);
+  if (res === null) {
     return stale ? failAll(`Apify run still unfinished after ${DESCRIPTION_CONFIG.APIFY_STALE_HOURS} hours`) : null;
   }
-
-  // A failed or timed-out run may still have scraped some jobs, so read what's there.
-  const items = apifyRequest(token, 'get', `/datasets/${run.datasetId}/items?clean=true&format=json`);
-  if (items.error) return stale ? failAll(items.error) : null;
-  const list = Array.isArray(items.data) ? items.data : [];
+  if (res.error) return stale ? failAll(res.error) : null;
+  const status = res.status;
+  const list = res.items;
   const runNote = status === 'SUCCEEDED' ? '' : `; Apify run ${status}`;
   Logger.log(`Apify run ${run.runId} ${status}: ${list.length} result(s) for ${run.jks.length} job(s).`
     + (list.length ? ` Fields in first result: ${Object.keys(list[0]).join(', ')}` : ''));
@@ -1164,6 +1153,27 @@ function finishApifyRun(token, run, deadline) {
     const html = typeof value === 'object' ? (value.html || value.text || JSON.stringify(value)) : value;
     return [jk, finishDescription(descriptionHtmlToText(html), 'Indeed')];
   }));
+}
+
+// Waits (until deadline, within the run's time budget) for an Apify run to
+// finish, then reads its results. Returns { status, items }, { error }, or
+// null if it's still going.
+function apifyRunItems(token, run, deadline) {
+  const unfinished = s => s === 'READY' || s === 'RUNNING';
+  let status = 'RUNNING';
+  do {
+    // waitForFinish holds the request open (max 45s, inside UrlFetchApp's limit).
+    const wait = Math.max(0, Math.min(45, Math.floor((deadline - Date.now()) / 1000)));
+    const poll = apifyRequest(token, 'get', `/actor-runs/${run.runId}?waitForFinish=${wait}`);
+    if (poll.error) return { error: poll.error };
+    status = poll.data.status;
+  } while (unfinished(status) && Date.now() < deadline && timeLeftMs() > 60 * 1000);
+  if (unfinished(status)) return null;
+
+  // A failed or timed-out run may still have scraped some jobs, so read what's there.
+  const items = apifyRequest(token, 'get', `/datasets/${run.datasetId}/items?clean=true&format=json`);
+  if (items.error) return { error: items.error };
+  return { status: status, items: Array.isArray(items.data) ? items.data : [] };
 }
 
 // Calls the Apify API. Returns { data } or { error } (details logged).
@@ -1238,6 +1248,67 @@ function debugIndeedDescriptions() {
   const items = apifyRequest(token, 'get', `/datasets/${run.datasetId}/items?clean=true&format=json`);
   if (items.data && items.data.length) Logger.log(`Fields in first result: ${Object.keys(items.data[0]).join(', ')}`);
   results.forEach((text, jk) => Logger.log(`${indeedViewUrl(jk)}\n  -> ${text.substring(0, 300)}`));
+}
+
+// One-off experiment for sponsored Indeed jobs, whose ad links carry no job
+// ID and which Indeed won't open for Apps Script. Takes up to three sponsored
+// leads from New Leads and runs two Apify tests side by side, logging what
+// comes back. Writes nothing to the sheet; costs a few pence.
+//   Test A: give Apify the ad links themselves, to see if its browser can
+//           follow them through to the job.
+//   Test B: search Indeed for each job's title + company in its town, to see
+//           if a result with the same company and title comes back.
+function debugSponsoredIndeed() {
+  runStartedAt = Date.now();
+  const token = PropertiesService.getScriptProperties().getProperty('APIFY_TOKEN');
+  if (!token) { Logger.log('APIFY_TOKEN not set in Script Properties.'); return; }
+  const sheet = getOrCreateSheet(SpreadsheetApp.getActiveSpreadsheet(), CONFIG.NEW_LEADS_SHEET_NAME);
+  const leads = readRows(sheet).filter(r => /indeed\.com\/pagead\//i.test(String(r[5]))).slice(0, 3);
+  if (!leads.length) { Logger.log('No sponsored Indeed leads (pagead links) in New Leads.'); return; }
+  leads.forEach((r, i) => Logger.log(`Lead ${i + 1}: ${r[1]} | ${r[2]} | ${r[3]}`));
+
+  const pick = (item, names) => { const n = names.find(k => item[k]); return n ? String(item[n]) : ''; };
+  const titleOf = item => pick(item, ['positionName', 'title', 'jobTitle', 'displayTitle']);
+  const companyOf = item => pick(item, ['company', 'companyName', 'employer']);
+  const descLength = item => { const f = APIFY_DESCRIPTION_FIELDS.find(k => item[k]); return f ? String(item[f]).length : 0; };
+  const start = (label, urls, maxItems) => {
+    const res = apifyRequest(token, 'post', `/acts/${DESCRIPTION_CONFIG.APIFY_ACTOR}/runs`, { startUrls: urls.map(u => ({ url: u })), maxItems: maxItems });
+    if (res.error) { Logger.log(`${label}: couldn't start Apify — ${res.error}`); return null; }
+    Logger.log(`${label}: Apify run ${res.data.id} started.`);
+    return { runId: res.data.id, datasetId: res.data.defaultDatasetId };
+  };
+
+  const runA = start('Test A (ad links)', leads.map(r => r[5]), leads.length);
+  const searchUrl = r => {
+    const town = /remote|uk-?wide|nationwide|united kingdom/i.test(String(r[3])) ? '' : String(r[3] || '');
+    return `https://uk.indeed.com/jobs?q=${encodeURIComponent(`${r[1]} ${r[2]}`)}${town ? `&l=${encodeURIComponent(town)}` : ''}`;
+  };
+  const runB = start('Test B (Indeed search)', leads.map(searchUrl), leads.length * 10);
+  const deadline = Date.now() + 240 * 1000;
+
+  if (runA) {
+    const res = apifyRunItems(token, runA, deadline);
+    if (!res) Logger.log('Test A: still running after 4 minutes — check it in the Apify console.');
+    else if (res.error) Logger.log(`Test A: ${res.error}`);
+    else {
+      Logger.log(`Test A: run ${res.status}, ${res.items.length} result(s) for ${leads.length} ad link(s).`);
+      if (res.items.length) Logger.log(`Test A first result: ${JSON.stringify(res.items[0]).substring(0, 600)}`);
+      res.items.forEach((it, i) => Logger.log(`Test A result ${i + 1}: ${titleOf(it)} | ${companyOf(it)} | description ${descLength(it)} chars`));
+    }
+  }
+  if (runB) {
+    const res = apifyRunItems(token, runB, deadline);
+    if (!res) Logger.log('Test B: still running after 4 minutes — check it in the Apify console.');
+    else if (res.error) Logger.log(`Test B: ${res.error}`);
+    else {
+      Logger.log(`Test B: run ${res.status}, ${res.items.length} search result(s).`);
+      leads.forEach((r, i) => {
+        const match = res.items.find(it => normalizeText(titleOf(it)) === normalizeText(r[1]) && normalizeText(companyOf(it)) === normalizeText(r[2]));
+        const sameCompany = res.items.filter(it => normalizeText(companyOf(it)) === normalizeText(r[2])).length;
+        Logger.log(`Test B lead ${i + 1} (${r[1]} | ${r[2]}): ${match ? `exact match found, description ${descLength(match)} chars` : `no exact match (${sameCompany} result(s) from the same company)`}`);
+      });
+    }
+  }
 }
 
 // One line for the daily email about leads inside the description window.
