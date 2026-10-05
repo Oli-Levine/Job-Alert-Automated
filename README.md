@@ -4,7 +4,14 @@ This repo holds a single Google Apps Script file, **`Code.gs`**, that automates 
 
 > Earlier on, this project renamed the file itself on every rewrite (`V17` → `V18`). That's retired: it duplicated what git already tracks for free, and made it easy to lose track of where an old version went. This doc exists to cover the versions from before that retirement; going forward, `git log` and the header comment's changelog are enough.
 
-## v22 — current (`Code.gs`)
+## v23 — current (`Code.gs`)
+
+Fixes after the first live v22 run:
+- **Rows stay one line tall.** LinkedIn descriptions contain line breaks, and Google Sheets was stretching each row to show the whole description. New Leads rows are now locked to normal height, and the full description is still in the cell.
+- **Sponsored Indeed jobs now get descriptions.** Their links are ad-tracking links with no job ID, so they used to say `FETCH FAILED (Indeed link has no job ID)`. Your earlier Apify test skipped these silently, which is why it looked like everything worked. The script now reads where each ad link redirects to, which reveals the job ID, then sends the job to Apify as normal. Those rows' **Link** becomes the clean Indeed job link. Ads that go straight to the employer's own website still can't be fetched, and their cell says so.
+- **Clearer Indeed failures.** When Apify refuses or fails a request, the `FETCH FAILED (...)` cell now shows Apify's own explanation instead of "see logs". The script log also records what each Apify run returned.
+
+## v22 — superseded (`git show 569e191:Code.gs`)
 
 **New `Job Description` column on New Leads (column G).** `Staff ID` moves from G to **H**. Existing rows are moved across automatically on the first run, so no Staff IDs are lost. Update the CRM import mapping to match.
 

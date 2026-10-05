@@ -1,7 +1,22 @@
 /**
- * JOB ALERT AUTOMATION v22
+ * JOB ALERT AUTOMATION v23
  * ------------------------------------------------------------
- * CHANGES FROM v21:
+ * CHANGES FROM v22:
+ *   - New Leads rows are forced to single-line height. Sheets grows a row to
+ *     show every line of a multi-line cell regardless of wrap/clip, so
+ *     LinkedIn descriptions were making rows very tall. The full text is
+ *     still in the cell.
+ *   - A failed Apify call now writes Apify's own error message into the
+ *     FETCH FAILED cell (not "see logs"), and every collected run logs its
+ *     status, result count and result field names.
+ *   - Sponsored Indeed jobs now get descriptions too. Their links are
+ *     ad-tracking redirects with no job ID, so they used to fail with "Indeed
+ *     link has no job ID" (the earlier Apify test skipped them silently).
+ *     resolveIndeedJobKeys() reads where each redirect points, without
+ *     opening the blocked job page, to get the ID; the row's Link becomes
+ *     the clean viewjob link and the job goes to Apify as normal.
+ *
+ * CHANGES FROM v21 (carried forward):
  *   - NEW "Job Description" column on New Leads (column G). Staff ID moves
  *     from G to H; existing rows are re-laid out automatically on the first
  *     run (ensureNewLeadsLayout()).
@@ -22,14 +37,6 @@
  *   - Emails already processed are skipped (PROCESSED_MESSAGES_KEY), so each
  *     alert goes to Claude once instead of on every run of its 4-day window.
  *   - The daily email says how many recent leads have a description.
- *
- * CHANGES FROM v20 (carried forward):
- *   - List changes apply to rows already in the sheet (applyListChanges(),
- *     every run and via applyListsNow()): blocklists move rows to Filtered
- *     Out; Unfilter Company moves AI-filtered rows out (AI region lookup);
- *     Company Regions moves rows from Other to New Leads. Moved rows leave
- *     their old tab; removing a list entry moves nothing back.
- *   - Region rules live in one shared REGION_RULES block.
  */
 
 const CONFIG = {
@@ -803,6 +810,10 @@ function rebuildNewLeadsTab(sheet, newRows) {
     const dataStartRow = 2;
     sheet.getRange(dataStartRow, 1, combined.length, numCols).setValues(combined);
     sheet.getRange(dataStartRow, 5, combined.length, 1).setNumberFormat('dd/mm/yyyy hh:mm');
+    // Sheets grows a row to show every line of a multi-line cell, whatever
+    // the wrap setting, so descriptions would make rows very tall. Forcing the
+    // height keeps every lead on one line; the full text is still in the cell.
+    sheet.setRowHeightsForced(dataStartRow, combined.length, NEW_LEADS_ROW_HEIGHT_PX);
   }
 
   // Auto-sizing the description column would stretch it to the longest
@@ -815,6 +826,7 @@ function rebuildNewLeadsTab(sheet, newRows) {
 }
 
 const DESCRIPTION_COLUMN_WIDTH_PX = 300;
+const NEW_LEADS_ROW_HEIGHT_PX = 21; // Sheets' default single-line row height
 
 // New Leads in an older layout (Staff ID in G) is converted before anything
 // appends rows to it, so new and old rows never end up mixed.
@@ -856,7 +868,7 @@ function linkedInJobId(link) {
 function indeedJobKey(link) {
   const s = String(link || '');
   if (!/indeed\.com/i.test(s)) return null;
-  const m = s.match(/[?&]jk=([^&#]+)/);
+  const m = s.match(/[?&]v?jk=([^&#]+)/);
   return m ? m[1] : null;
 }
 
@@ -870,6 +882,12 @@ function fillJobDescriptions(sheet, retryFailed) {
   const updates = new Map(); // row index -> new cell text
   const linkedIn = [];
   const indeedRowsByJk = new Map();
+  const sponsoredIndeed = []; // Indeed rows whose link has no job ID
+  const queueIndeed = (i, jk) => {
+    if (trackedJks.has(jk)) { updates.set(i, DESCRIPTION_PENDING); return; } // already in a running Apify run
+    if (!indeedRowsByJk.has(jk)) indeedRowsByJk.set(jk, []);
+    indeedRowsByJk.get(jk).push(i);
+  };
 
   rows.forEach((row, i) => {
     if (!inDescriptionWindow(row[4])) return;
@@ -883,11 +901,9 @@ function fillJobDescriptions(sheet, retryFailed) {
     if (linkedInJobId(row[5])) {
       linkedIn.push(i);
     } else if (jk) {
-      if (trackedJks.has(jk)) { updates.set(i, DESCRIPTION_PENDING); return; } // already in a running Apify run
-      if (!indeedRowsByJk.has(jk)) indeedRowsByJk.set(jk, []);
-      indeedRowsByJk.get(jk).push(i);
+      queueIndeed(i, jk);
     } else if (/indeed\.com/i.test(String(row[5]))) {
-      updates.set(i, `${DESCRIPTION_FAILED} (Indeed link has no job ID)`);
+      sponsoredIndeed.push(i);
     } else {
       updates.set(i, `${DESCRIPTION_FAILED} (no LinkedIn or Indeed job link)`);
     }
@@ -906,13 +922,78 @@ function fillJobDescriptions(sheet, retryFailed) {
     batch.forEach((i, k) => updates.set(i, texts[k]));
   }
 
+  // Sponsored Indeed links are ad-tracking redirects with no job ID in them.
+  // Indeed's redirect points at the job page, which does carry the ID, so
+  // read where it points (without following it to the blocked page). The
+  // row's Link is replaced with the clean job link, so the Apify result can
+  // be matched back to it and the CRM gets a link that doesn't expire.
+  const linkUpdates = new Map(); // row index -> clean Indeed job link
+  if (sponsoredIndeed.length && timeLeftMs() >= 60 * 1000) {
+    const resolved = resolveIndeedJobKeys(sponsoredIndeed.map(i => rows[i][5]));
+    sponsoredIndeed.forEach((i, k) => {
+      const r = resolved[k];
+      if (!r.jk) { updates.set(i, `${DESCRIPTION_FAILED} (${r.reason})`); return; }
+      linkUpdates.set(i, indeedViewUrl(r.jk));
+      queueIndeed(i, r.jk);
+    });
+  }
+
   if (indeedRowsByJk.size > 0) {
     const started = startApifyRun([...indeedRowsByJk.keys()]);
     const text = started.error ? `${DESCRIPTION_FAILED} (${started.error})` : DESCRIPTION_PENDING;
     indeedRowsByJk.forEach(indexes => indexes.forEach(i => updates.set(i, text)));
   }
 
+  linkUpdates.forEach((link, i) => sheet.getRange(i + 2, 6).setValue(link));
   writeDescriptions(sheet, updates);
+}
+
+// For Indeed links with no job ID (sponsored ad-tracking links), reads each
+// redirect's destination — up to 3 hops, never downloading the job page
+// itself, which Indeed blocks — and returns [{ jk } or { reason }] in order.
+function resolveIndeedJobKeys(links) {
+  const current = links.slice();
+  const results = links.map(() => null);
+  for (let hop = 0; hop < 3; hop++) {
+    const open = current.map((url, k) => k).filter(k => !results[k]);
+    if (!open.length) break;
+    const responses = fetchAllSafely(open.map(k => ({ url: current[k], followRedirects: false, muteHttpExceptions: true })), 'Indeed redirect');
+    open.forEach((k, n) => {
+      const res = responses[n];
+      if (!res) { results[k] = { reason: 'Indeed sponsored link could not be opened — see logs' }; return; }
+      const code = res.getResponseCode();
+      const headers = res.getAllHeaders();
+      let next = String(headers.Location || headers.location || '');
+      if (next.startsWith('/')) next = `https://uk.indeed.com${next}`;
+      if (code >= 300 && code < 400 && next) {
+        const jk = indeedJobKey(next);
+        if (jk) results[k] = { jk: jk };
+        else if (/indeed\.com/i.test(next)) current[k] = next; // another Indeed redirect — follow it
+        else results[k] = { reason: "Indeed sponsored link goes to the employer's own site, not an Indeed job page" };
+      } else {
+        const inBody = code === 200 ? res.getContentText().match(/[?&]v?jk=([0-9a-f]{16})/) : null;
+        results[k] = inBody ? { jk: inBody[1] } : { reason: `Indeed sponsored link has no job ID, and Indeed returned status ${code} when it was opened` };
+      }
+    });
+  }
+  return results.map(r => r || { reason: 'Indeed sponsored link has no job ID (too many redirects)' });
+}
+
+// UrlFetchApp.fetchAll throws if any one request fails outright, so on
+// failure retry one by one; a request that still fails comes back as null.
+function fetchAllSafely(requests, label) {
+  try {
+    return UrlFetchApp.fetchAll(requests);
+  } catch (err) {
+    return requests.map(req => {
+      try {
+        return UrlFetchApp.fetch(req.url, req);
+      } catch (e) {
+        Logger.log(`${label} request failed for ${req.url}: ${e}`);
+        return null;
+      }
+    });
+  }
 }
 
 function writeDescriptions(sheet, updates) {
@@ -929,21 +1010,7 @@ function fetchLinkedInDescriptions(links) {
     muteHttpExceptions: true,
     followRedirects: true
   }));
-  let responses;
-  try {
-    responses = UrlFetchApp.fetchAll(requests);
-  } catch (err) {
-    // fetchAll throws if any one request fails outright, so retry one by one.
-    responses = requests.map(req => {
-      try {
-        return UrlFetchApp.fetch(req.url, req);
-      } catch (e) {
-        Logger.log(`LinkedIn download failed for ${req.url}: ${e}`);
-        return null;
-      }
-    });
-  }
-  return responses.map(linkedInDescriptionFromResponse);
+  return fetchAllSafely(requests, 'LinkedIn download').map(linkedInDescriptionFromResponse);
 }
 
 function linkedInDescriptionFromResponse(response) {
@@ -1084,6 +1151,8 @@ function finishApifyRun(token, run, deadline) {
   if (items.error) return stale ? failAll(items.error) : null;
   const list = Array.isArray(items.data) ? items.data : [];
   const runNote = status === 'SUCCEEDED' ? '' : `; Apify run ${status}`;
+  Logger.log(`Apify run ${run.runId} ${status}: ${list.length} result(s) for ${run.jks.length} job(s).`
+    + (list.length ? ` Fields in first result: ${Object.keys(list[0]).join(', ')}` : ''));
 
   return new Map(run.jks.map(jk => {
     // The field holding the job ID varies, so match on the whole result.
@@ -1110,15 +1179,18 @@ function apifyRequest(token, method, path, payload) {
     response = UrlFetchApp.fetch(DESCRIPTION_CONFIG.APIFY_API + path, options);
   } catch (err) {
     Logger.log(`Apify request failed (${path}): ${err}`);
-    return { error: 'Apify request failed — see logs' };
+    return { error: `Apify request failed: ${String(err).substring(0, 150)}` };
   }
   const code = response.getResponseCode();
   const body = response.getContentText();
   if (code < 200 || code >= 300) {
-    // 401 = bad token; 402/403 usually = out of credit, or the scraper hasn't
-    // been added to the Apify account yet ("Try for free" on its page).
+    // 401 = bad token; 402/403 usually = out of credit, the scraper's free
+    // trial has ended, or it hasn't been added to the Apify account yet.
+    // Apify's own message goes into the cell so the cause is visible there.
     Logger.log(`Apify returned status ${code} for ${path}: ${body.substring(0, 500)}`);
-    return { error: `Apify returned status ${code} — see logs` };
+    let message = '';
+    try { message = JSON.parse(body).error.message || ''; } catch (e) { message = body; }
+    return { error: `Apify returned status ${code}: ${String(message).substring(0, 150)}` };
   }
   try {
     const parsed = JSON.parse(body);
