@@ -22,6 +22,9 @@
  *   - Emails already processed are skipped (PROCESSED_MESSAGES_KEY), so each
  *     alert goes to Claude once instead of on every run of its 4-day window.
  *   - The daily email says how many recent leads have a description.
+ *   - Column widths: Job Description is the only fixed-width column (text
+ *     clipped at the edge); every other column, including Link, now fits
+ *     its contents on every tab.
  *
  * CHANGES FROM v20 (carried forward):
  *   - List changes apply to rows already in the sheet (applyListChanges(),
@@ -805,11 +808,11 @@ function rebuildNewLeadsTab(sheet, newRows) {
     sheet.getRange(dataStartRow, 5, combined.length, 1).setNumberFormat('dd/mm/yyyy hh:mm');
   }
 
-  // Auto-sizing the description column would stretch it to the longest
-  // description, so it gets a fixed width and clipped text instead.
+  // Every column fits its contents except Job Description: auto-sizing it
+  // would stretch it to the longest description, so it gets a fixed width
+  // and shows the start of the text, clipped at the column edge.
   sheet.autoResizeColumns(1, TAB_HEADERS.length);
   sheet.autoResizeColumns(NL_STAFF_ID + 1, 1);
-  applyFixedLinkColumnWidth(sheet);
   sheet.setColumnWidth(NL_DESCRIPTION + 1, DESCRIPTION_COLUMN_WIDTH_PX);
   sheet.getRange(1, NL_DESCRIPTION + 1, sheet.getMaxRows(), 1).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
 }
@@ -1494,24 +1497,6 @@ function autoResizeSheet(sheet) {
   const lastCol = sheet.getLastColumn();
   if (lastCol < 1) return;
   sheet.autoResizeColumns(1, lastCol);
-  applyFixedLinkColumnWidth(sheet);
-}
-
-// Link is always column F (6) across every tab layout (New Leads, Other,
-// Needs Review, Filtered Out). Auto-resize stretches it to fit
-// full URLs, which makes it unreadable — fix it to a set width instead.
-const LINK_COLUMN_WIDTH_PX = 150;
-const LINK_COLUMN_INDEX = 6;
-
-function applyFixedLinkColumnWidth(sheet) {
-  if (sheet.getLastColumn() >= LINK_COLUMN_INDEX) {
-    sheet.setColumnWidth(LINK_COLUMN_INDEX, LINK_COLUMN_WIDTH_PX);
-    // Clip instead of overflow — otherwise a long URL visually bleeds into
-    // empty neighboring columns and LOOKS like the column never resized,
-    // even though its actual width is fixed correctly underneath.
-    sheet.getRange(1, LINK_COLUMN_INDEX, sheet.getMaxRows(), 1)
-      .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
-  }
 }
 
 // ==========================================================================
