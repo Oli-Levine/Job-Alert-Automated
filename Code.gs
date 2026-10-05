@@ -1,40 +1,36 @@
 /**
- * JOB ALERT AUTOMATION v20
+ * JOB ALERT AUTOMATION v21
  * ------------------------------------------------------------
- * CHANGES FROM v19:
- *   - NEW "Unfilter Company" tab (single column, Company). If the AI
- *     filters a job from a company on this list, the filter is reversed
- *     and the job routes as normal: New Leads with its region's Staff ID
- *     (or Other / Needs Review, same rules as any routed job). The AI is
- *     now asked to give a region for filtered jobs too, so there's a
- *     region to route with. Only reverses the AI's own "filter" — the
- *     manual Company / Job Title Blocklists still win over it.
- *   - A job rescued this way skips the Filtered Out dedup check, so a job
- *     the AI filtered on an earlier run can still reach New Leads while
- *     its email is inside LOOKBACK_DAYS. The old Filtered Out row is left
- *     in place as a record.
- *   - Bournemouth, Poole and Christchurch now go to Southern Home Counties
- *     (Ray), not South West. Set in the prompt, like the Peterborough
- *     exception, and enforced in code (SOUTHERN_HOME_COUNTIES_TOWNS) in
- *     case the AI still answers South West for them.
- *   - Daily schedule built into this script: processJobAlerts() runs at
- *     ~07:30 and runDailySend() emails the workbook at ~08:30 (UK time)
- *     to DAILY_SEND_CONFIG.RECIPIENT_EMAILS, as an .xlsx attachment plus
- *     a link to the live Google Sheet (recipients are given viewer
- *     access so the link opens). Set up once with
- *     createDailyTriggers(). Replaces createDailyTrigger(),
- *     dailyRunAndSend() and createDailyRunAndSendTrigger().
+ * CHANGES FROM v20:
+ *   - List changes now apply to rows ALREADY in the sheet, not just to new
+ *     jobs. At the start of every processJobAlerts() run (and on demand via
+ *     applyListsNow()), applyListChanges() re-checks existing rows:
+ *       - Company Blocklist / Job Title Blocklist: matching rows in New
+ *         Leads, Other and Needs Review move to Filtered Out.
+ *       - Unfilter Company: rows in Filtered Out that the AI filtered (not
+ *         the blocklists) move out. Filtered Out stores no region, so one
+ *         batched AI call places their towns; they then route as normal
+ *         (New Leads + Staff ID, or Other / Needs Review). If that AI call
+ *         fails, they stay put and are retried next run.
+ *       - Company Regions: matching rows in Other move to New Leads with
+ *         that region's Staff ID. Rows already in New Leads are left alone.
+ *   - Moved rows leave their old tab — each job is in exactly one tab. This
+ *     replaces v20's "rescued job skips the Filtered Out dedup and keeps
+ *     its old row" behaviour.
+ *   - Removing an entry from a list does NOT move rows back; it only stops
+ *     future jobs being affected.
+ *   - The region rules in the prompt are now one shared REGION_RULES block,
+ *     used by both the job-extraction prompt and the new region lookup.
  *
- * CHANGES FROM v18 (carried forward — sheet now feeds a CRM import):
- *   - NEW "Staff ID" column on New Leads (column G, after Link), from the
- *     old v17 region -> consultant mapping but outputting CRM Staff IDs.
- *     North West -> Craig only. Pre-v19 rows keep a blank Staff ID.
- *     Appended at the end so Date Found (E) and Link (F) keep the
- *     positions dedup and sorting rely on; Other keeps 6 columns.
- *   - NEW "Job Title Blocklist" tab, same normalised exact match as
- *     Company Blocklist.
- *   - REMOVED (for now) the 30-day resurfacing flag and the 84-day purge;
- *     dedup is permanent. Recoverable from git history (v18 = c51aff2).
+ * CHANGES FROM v19 (carried forward):
+ *   - NEW "Unfilter Company" tab: reverses the AI's own "filter" for
+ *     listed companies so their jobs route as normal. The prompt asks for
+ *     a region on filtered jobs too. The manual blocklists still win.
+ *   - Bournemouth, Poole and Christchurch -> Southern Home Counties (Ray),
+ *     in the prompt and enforced in code (SOUTHERN_HOME_COUNTIES_TOWNS).
+ *   - Daily schedule: processJobAlerts() ~07:30, runDailySend() ~08:30 UK
+ *     time, emailing an .xlsx plus a live-sheet link to
+ *     DAILY_SEND_CONFIG.RECIPIENT_EMAILS. Set up with createDailyTriggers().
  */
 
 const CONFIG = {
@@ -129,6 +125,13 @@ const UNFILTER_HEADERS = ['Company'];
 const SOUTHERN_HOME_COUNTIES_TOWNS = /\b(bournemouth|poole|christchurch)\b/i;
 const COMPANY_REGIONS_HEADERS = ['Company', 'Region'];
 
+// Filtered Out / Needs Review reasons the script writes itself. Rows filtered
+// for a blocklist reason are never unfiltered by Unfilter Company, which only
+// reverses the AI's own decision.
+const REASON_COMPANY_BLOCKLIST = 'Company on blocklist';
+const REASON_TITLE_BLOCKLIST = 'Job title on blocklist';
+const REASON_UNFILTER_NO_REGION = 'Unfilter Company, but AI gave no usable region';
+
 // ---- Job link detection (kept deterministic — not handed to the AI) ----------
 const JOB_LINK_PATTERNS = [
   /indeed\.com\/rc\/clk\/dl/i, /indeed\.com\/pagead\/clk\/dl/i,
@@ -143,27 +146,13 @@ const JOB_LINK_PATTERNS = [
 function processJobAlerts() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  const tabSheets = {};
-  ALL_TAB_NAMES.forEach(tabName => { tabSheets[tabName] = getOrCreateSheet(ss, tabName); });
-  FLAT_TABS.forEach(tabName => ensureHeaders(tabSheets[tabName], TAB_HEADERS));
+  const sheets = openWorkingSheets(ss);
+  const { tabSheets, reviewSheet, filteredSheet } = sheets;
+  const lists = loadOverrideLists(ss);
+  const { unfilterCompanies, companyRegionOverrides } = lists;
 
-  const reviewSheet = getOrCreateSheet(ss, CONFIG.NEEDS_REVIEW_SHEET_NAME);
-  ensureHeaders(reviewSheet, REVIEW_HEADERS);
-  const filteredSheet = getOrCreateSheet(ss, CONFIG.FILTERED_SHEET_NAME);
-  ensureHeaders(filteredSheet, FILTERED_HEADERS);
-  const blocklistSheet = getOrCreateSheet(ss, CONFIG.BLOCKLIST_SHEET_NAME);
-  ensureHeaders(blocklistSheet, BLOCKLIST_HEADERS);
-  const blockedCompanies = loadBlocklist(blocklistSheet);
-  const titleBlocklistSheet = getOrCreateSheet(ss, CONFIG.TITLE_BLOCKLIST_SHEET_NAME);
-  ensureHeaders(titleBlocklistSheet, TITLE_BLOCKLIST_HEADERS);
-  const blockedTitles = loadBlocklist(titleBlocklistSheet);
-  const unfilterSheet = getOrCreateSheet(ss, CONFIG.UNFILTER_SHEET_NAME);
-  ensureHeaders(unfilterSheet, UNFILTER_HEADERS);
-  const unfilterCompanies = loadBlocklist(unfilterSheet);
-
-  const companyRegionsSheet = getOrCreateSheet(ss, CONFIG.COMPANY_REGIONS_SHEET_NAME);
-  ensureHeaders(companyRegionsSheet, COMPANY_REGIONS_HEADERS);
-  const companyRegionOverrides = loadCompanyRegions(companyRegionsSheet);
+  // Runs before the dedup sets are loaded, so they reflect where rows ended up.
+  applyListChanges(sheets, lists);
 
   const existingLinksByTab = {};
   const existingKeysByTab = {};
@@ -206,7 +195,7 @@ function processJobAlerts() {
         const aiFilteredUnfilterCompany = job.action === 'filter' && unfilterCompanies.has(normalizeText(job.company));
         if (aiFilteredUnfilterCompany) {
           job.action = 'route';
-          job.reason = 'Unfilter Company, but AI gave no usable region';
+          job.reason = REASON_UNFILTER_NO_REGION;
         }
 
         // Code-level blocklist enforcement — overrides whatever the AI
@@ -214,22 +203,17 @@ function processJobAlerts() {
         // of whether the AI recognised it as an agency/law firm/etc.
         // Job Title Blocklist works the same way; only checked when the
         // company isn't already blocked, so each job counts once.
-        if (blockedCompanies.has(normalizeText(job.company))) {
+        const blockReason = blocklistReason(job.company, job.title, lists);
+        if (blockReason) {
           job.action = 'filter';
-          job.reason = 'Company on blocklist';
-          blockedCount++;
-        } else if (blockedTitles.has(normalizeText(job.title))) {
-          job.action = 'filter';
-          job.reason = 'Job title on blocklist';
-          blockedTitleCount++;
+          job.reason = blockReason;
+          if (blockReason === REASON_COMPANY_BLOCKLIST) blockedCount++;
+          else blockedTitleCount++;
         }
 
-        const rescued = aiFilteredUnfilterCompany && job.action === 'route';
-        if (rescued) unfilteredCount++;
+        if (aiFilteredUnfilterCompany && job.action === 'route') unfilteredCount++;
 
-        if (job.action === 'route' && job.region === 'South West' && SOUTHERN_HOME_COUNTIES_TOWNS.test(job.town || '')) {
-          job.region = 'Southern Home Counties';
-        }
+        if (job.action === 'route') job.region = applyTownRegionRules(job.region, job.town);
 
         // Company Regions override — only applies to jobs the AI already
         // classified as "Other" (Remote/UK-wide, no real town). A
@@ -248,13 +232,11 @@ function processJobAlerts() {
         const jobKey = normalizeJobKey(job.title, job.company, town);
 
         // Dedup is permanent: with no purge, a job seen once in Filtered
-        // Out / Needs Review is never reprocessed. The exception is a job
-        // rescued by Unfilter Company, which skips the Filtered Out check
-        // so a job filtered on an earlier run can still reach New Leads
-        // (its old Filtered Out row is left as a record).
-        const inFiltered = !rescued && ((link && filteredLinks.has(link)) || filteredKeys.has(jobKey));
-        const inReview = (link && reviewLinks.has(link)) || reviewKeys.has(jobKey);
-        if (inFiltered || inReview) return;
+        // Out / Needs Review is never reprocessed here. Jobs that should
+        // leave Filtered Out because of a list change are moved by
+        // applyListChanges() at the start of the run instead.
+        if (link && (filteredLinks.has(link) || reviewLinks.has(link))) return;
+        if (filteredKeys.has(jobKey) || reviewKeys.has(jobKey)) return;
 
         if (job.action === 'filter') {
           filteredSheet.appendRow([source, job.title, job.company, town, dateFound, link, job.reason || 'Filtered by AI']);
@@ -323,6 +305,153 @@ function processJobAlerts() {
 }
 
 // ==========================================================================
+// SHEETS + OVERRIDE LISTS
+// ==========================================================================
+
+function openWorkingSheets(ss) {
+  const tabSheets = {};
+  ALL_TAB_NAMES.forEach(tabName => { tabSheets[tabName] = getOrCreateSheet(ss, tabName); });
+  FLAT_TABS.forEach(tabName => ensureHeaders(tabSheets[tabName], TAB_HEADERS));
+  const reviewSheet = getOrCreateSheet(ss, CONFIG.NEEDS_REVIEW_SHEET_NAME);
+  ensureHeaders(reviewSheet, REVIEW_HEADERS);
+  const filteredSheet = getOrCreateSheet(ss, CONFIG.FILTERED_SHEET_NAME);
+  ensureHeaders(filteredSheet, FILTERED_HEADERS);
+  return { tabSheets, reviewSheet, filteredSheet };
+}
+
+function loadOverrideLists(ss) {
+  const listSheet = (name, headers) => {
+    const sheet = getOrCreateSheet(ss, name);
+    ensureHeaders(sheet, headers);
+    return sheet;
+  };
+  return {
+    blockedCompanies: loadBlocklist(listSheet(CONFIG.BLOCKLIST_SHEET_NAME, BLOCKLIST_HEADERS)),
+    blockedTitles: loadBlocklist(listSheet(CONFIG.TITLE_BLOCKLIST_SHEET_NAME, TITLE_BLOCKLIST_HEADERS)),
+    unfilterCompanies: loadBlocklist(listSheet(CONFIG.UNFILTER_SHEET_NAME, UNFILTER_HEADERS)),
+    companyRegionOverrides: loadCompanyRegions(listSheet(CONFIG.COMPANY_REGIONS_SHEET_NAME, COMPANY_REGIONS_HEADERS))
+  };
+}
+
+// The Filtered Out reason if a company/title is on a blocklist, else null.
+// Company is checked first so each job is counted against one list only.
+function blocklistReason(company, title, lists) {
+  if (lists.blockedCompanies.has(normalizeText(company))) return REASON_COMPANY_BLOCKLIST;
+  if (lists.blockedTitles.has(normalizeText(title))) return REASON_TITLE_BLOCKLIST;
+  return null;
+}
+
+// Region exceptions enforced in code on top of the AI's answer.
+function applyTownRegionRules(region, town) {
+  if (region === 'South West' && SOUTHERN_HOME_COUNTIES_TOWNS.test(town || '')) return 'Southern Home Counties';
+  return region;
+}
+
+// ==========================================================================
+// LIST CHANGES — re-apply the override lists to rows already in the sheet
+// ==========================================================================
+// Runs at the start of every processJobAlerts(), and on demand via
+// applyListsNow(). Moves rows so the sheet reflects the lists as they are
+// now, not as they were when each job first arrived:
+//   1. Company / Job Title Blocklist: matching rows in New Leads, Other and
+//      Needs Review move to Filtered Out.
+//   2. Unfilter Company: rows in Filtered Out that the AI filtered (not the
+//      blocklists) move out. Filtered Out stores no region, so
+//      lookupRegionsForRows() asks the AI to place them; then they route as
+//      normal. If that lookup fails they stay put and are retried next run.
+//   3. Company Regions: matching rows in Other move to New Leads with the
+//      region's Staff ID (run last, so it also catches step 2's Other rows).
+// A moved row leaves its old tab. Removing an entry from a list moves
+// nothing back — it only stops future jobs being affected.
+
+function applyListChanges(sheets, lists) {
+  const newLeads = sheets.tabSheets[CONFIG.NEW_LEADS_SHEET_NAME];
+  const other = sheets.tabSheets[CONFIG.OTHER_SHEET_NAME];
+  const review = sheets.reviewSheet;
+  const filtered = sheets.filteredSheet;
+  const toNewLeads = (r, region) => newLeads.appendRow([...r.slice(0, 6), REGION_TO_STAFF_ID[region]]);
+
+  // 1. Blocklists
+  let blocked = 0;
+  [newLeads, other, review].forEach(sheet => {
+    takeRows(sheet, r => blocklistReason(r[2], r[1], lists) !== null).forEach(r => {
+      filtered.appendRow([...r.slice(0, 6), blocklistReason(r[2], r[1], lists)]);
+      blocked++;
+    });
+  });
+
+  // 2. Unfilter Company
+  let unfiltered = 0, unfilterPending = 0;
+  const isUnfilterRow = r =>
+    lists.unfilterCompanies.has(normalizeText(r[2]))
+    && r[6] !== REASON_COMPANY_BLOCKLIST && r[6] !== REASON_TITLE_BLOCKLIST
+    && blocklistReason(r[2], r[1], lists) === null;
+  const unfilterRows = readRows(filtered).filter(isUnfilterRow);
+  if (unfilterRows.length > 0) {
+    const regions = lookupRegionsForRows(unfilterRows);
+    if (regions === null) {
+      unfilterPending = unfilterRows.length;
+    } else {
+      takeRows(filtered, isUnfilterRow);
+      unfilterRows.forEach((r, i) => {
+        const region = applyTownRegionRules(regions[i], r[3]);
+        if (region === 'Other') other.appendRow(r.slice(0, 6));
+        else if (REGION_TO_STAFF_ID[region]) toNewLeads(r, region);
+        else review.appendRow([...r.slice(0, 6), REASON_UNFILTER_NO_REGION]);
+        unfiltered++;
+      });
+    }
+  }
+
+  // 3. Company Regions
+  let redirected = 0;
+  takeRows(other, r => lists.companyRegionOverrides.has(normalizeText(r[2]))).forEach(r => {
+    toNewLeads(r, lists.companyRegionOverrides.get(normalizeText(r[2])));
+    redirected++;
+  });
+
+  if (blocked || unfiltered || unfilterPending || redirected) {
+    Logger.log(`List changes applied to existing rows: ${blocked} moved to Filtered Out (blocklists), ${unfiltered} moved out of Filtered Out (Unfilter Company), ${redirected} moved from Other to New Leads (Company Regions).`
+      + (unfilterPending ? ` ${unfilterPending} Unfilter Company row(s) left in Filtered Out because the AI region lookup failed — retried next run.` : ''));
+  }
+}
+
+// Run by hand after editing a list to apply it straight away, without
+// waiting for the next daily run. Doesn't fetch any new emails.
+function applyListsNow() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = openWorkingSheets(ss);
+  applyListChanges(sheets, loadOverrideLists(ss));
+  REBUILD_TABS.forEach(tabName => rebuildNewLeadsTab(sheets.tabSheets[tabName], []));
+  [...FLAT_TABS.map(t => sheets.tabSheets[t]), sheets.reviewSheet, sheets.filteredSheet].forEach(sheet => {
+    formatDateColumn(sheet);
+    sortNewestFirst(sheet);
+    autoResizeSheet(sheet);
+  });
+  Logger.log('Done. Lists applied to existing rows.');
+}
+
+// Data rows (below the header) of a tab that has a single header row.
+function readRows(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  return sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+}
+
+// Removes the data rows matching `predicate` from the tab, keeping the rest
+// in order, and returns the removed rows.
+function takeRows(sheet, predicate) {
+  const rows = readRows(sheet);
+  const taken = rows.filter(predicate);
+  if (taken.length === 0) return [];
+  const kept = rows.filter(r => !predicate(r));
+  const numCols = rows[0].length;
+  sheet.getRange(2, 1, rows.length, numCols).clearContent();
+  if (kept.length > 0) sheet.getRange(2, 1, kept.length, numCols).setValues(kept);
+  return taken;
+}
+
+// ==========================================================================
 // EMAIL PREP — keeps job links attached, strips everything else
 // ==========================================================================
 
@@ -387,13 +516,17 @@ function isJobLink(href) {
 // ==========================================================================
 
 function callClaudeForJobs(emailText, source) {
+  return callClaude(buildPrompt(emailText, source));
+}
+
+// Sends one prompt to Claude and returns the JSON array it replies with, or
+// null on any failure (already logged), so callers can skip and retry later.
+function callClaude(prompt) {
   const apiKey = PropertiesService.getScriptProperties().getProperty('CLAUDE_API_KEY');
   if (!apiKey) {
-    Logger.log('CLAUDE_API_KEY not set in Script Properties — skipping this email. Project Settings > Script Properties > add CLAUDE_API_KEY.');
+    Logger.log('CLAUDE_API_KEY not set in Script Properties — skipping this AI call. Project Settings > Script Properties > add CLAUDE_API_KEY.');
     return null;
   }
-
-  const prompt = buildPrompt(emailText, source);
 
   let response;
   try {
@@ -447,6 +580,17 @@ function callClaudeForJobs(emailText, source) {
   }
 }
 
+// Shared by the job-extraction prompt and the region lookup, so the region
+// rules (and their exceptions) only live in one place.
+const REGION_RULES = `Assign the town/location to exactly one region from this list, using this guidance:
+- Scotland, North East, Yorkshire, North West, West Midlands, East Midlands, London, South West, Ireland — standard UK regions/postcode areas
+- East Anglia — Norfolk, Suffolk, Cambridgeshire, Essex only (e.g. Cambridge, Norwich, Ipswich, Chelmsford, Colchester, Ely)
+  - EXCEPTION: Peterborough is classified as East Midlands, NOT East Anglia, even though it sits in Cambridgeshire. Always route Peterborough to East Midlands.
+- Northern Home Counties — Oxfordshire, Buckinghamshire, Bedfordshire, Hertfordshire (e.g. Oxford, Milton Keynes, Luton, St Albans, Watford)
+- Southern Home Counties — Surrey, Kent, Sussex, Hampshire, Berkshire (e.g. Reading, Guildford, Brighton, Southampton, Portsmouth)
+  - EXCEPTION: Bournemouth, Poole and Christchurch are classified as Southern Home Counties, NOT South West, even though they sit in Dorset. Always route them to Southern Home Counties.
+- Other — use this confidently for: Remote, UK-wide, Nationwide, Work From Home, "United Kingdom", or any listing where the location is clearly national/non-specific rather than tied to a real town.`;
+
 function buildPrompt(emailText, source) {
   return `You are extracting job listings from a ${source} job alert email for a legal recruitment company (BCL Legal). The email text below has job links marked inline as [JOBLINK:ID] right after the job title text, where ID is a short code like L1, L2, L3.
 
@@ -466,14 +610,8 @@ FILTERING RULES (action = "filter"):
 - General recruitment/staffing agencies
 
 REGION ASSIGNMENT:
-Assign the town/location to exactly one region from this list, using this guidance:
-- Scotland, North East, Yorkshire, North West, West Midlands, East Midlands, London, South West, Ireland — standard UK regions/postcode areas
-- East Anglia — Norfolk, Suffolk, Cambridgeshire, Essex only (e.g. Cambridge, Norwich, Ipswich, Chelmsford, Colchester, Ely)
-  - EXCEPTION: Peterborough is classified as East Midlands, NOT East Anglia, even though it sits in Cambridgeshire. Always route Peterborough to East Midlands.
-- Northern Home Counties — Oxfordshire, Buckinghamshire, Bedfordshire, Hertfordshire (e.g. Oxford, Milton Keynes, Luton, St Albans, Watford)
-- Southern Home Counties — Surrey, Kent, Sussex, Hampshire, Berkshire (e.g. Reading, Guildford, Brighton, Southampton, Portsmouth)
-  - EXCEPTION: Bournemouth, Poole and Christchurch are classified as Southern Home Counties, NOT South West, even though they sit in Dorset. Always route them to Southern Home Counties.
-- Other — use this confidently (do NOT send to review) for: Remote, UK-wide, Nationwide, Work From Home, "United Kingdom", or any listing where the location is clearly national/non-specific rather than tied to a real town. These should always be routed to Other, never sent to review.
+${REGION_RULES}
+Listings that fit the Other rule should always be routed to Other, never sent to review.
 
 If the town is genuinely ambiguous, unrecognisable, or missing in a way that ISN'T covered by the Other rule above, use action "review" with a reason instead of guessing.
 
@@ -481,6 +619,42 @@ Respond with ONLY the JSON array. No markdown code fences, no commentary, no exp
 
 EMAIL TEXT:
 ${emailText}`;
+}
+
+// Places existing sheet rows ([source, title, company, town, ...]) in a
+// region, for rows that never had one stored (e.g. Filtered Out). Returns an
+// array of regions in row order ('' where the AI couldn't place it), or null
+// if any AI call failed — callers leave those rows alone and retry next run.
+const REGION_LOOKUP_BATCH_SIZE = 50;
+
+function lookupRegionsForRows(rows) {
+  const regions = [];
+  for (let start = 0; start < rows.length; start += REGION_LOOKUP_BATCH_SIZE) {
+    const batch = rows.slice(start, start + REGION_LOOKUP_BATCH_SIZE);
+    const listings = batch
+      .map((r, i) => `${i + 1}. Job title: ${r[1]} | Company: ${r[2]} | Location: ${r[3] || '(not shown)'}`)
+      .join('\n');
+    const result = callClaude(`You are assigning UK job listings for a legal recruitment company (BCL Legal) to regions.
+
+For each numbered listing below, return a JSON array with one object per listing: {"id": <the listing's number>, "region": <string>}.
+"region" must be exactly one of: ${REGIONS.join(', ')} — or an empty string if the location is missing, ambiguous or unrecognisable in a way the Other rule doesn't cover.
+
+${REGION_RULES}
+
+Respond with ONLY the JSON array. No markdown code fences, no commentary.
+
+LISTINGS:
+${listings}`);
+    if (result === null) return null;
+
+    const batchRegions = batch.map(() => '');
+    result.forEach(item => {
+      const idx = Number(item && item.id) - 1;
+      if (idx >= 0 && idx < batch.length && REGIONS.includes(item.region)) batchRegions[idx] = item.region;
+    });
+    regions.push(...batchRegions);
+  }
+  return regions;
 }
 
 // ==========================================================================

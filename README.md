@@ -4,12 +4,29 @@ This repo holds a single Google Apps Script file, **`Code.gs`**, that automates 
 
 > Earlier on, this project renamed the file itself on every rewrite (`V17` → `V18`). That's retired: it duplicated what git already tracks for free, and made it easy to lose track of where an old version went. This doc exists to cover the versions from before that retirement; going forward, `git log` and the header comment's changelog are enough.
 
-## v20 — current (`Code.gs`)
+## v21 — current (`Code.gs`)
+
+**Editing a list now moves jobs that are already in the sheet,** not just future ones. Every daily run starts by checking existing rows against your lists:
+
+| You add… | What moves |
+| --- | --- |
+| A company to `Company Blocklist`, or a title to `Job Title Blocklist` | Its rows in `New Leads`, `Other` and `Needs Review` move to `Filtered Out`. |
+| A company to `Unfilter Company` | Its rows in `Filtered Out` that the AI filtered move out, however old they are. The AI places each job's town to pick the consultant, then the job goes to `New Leads` with its Staff ID. Remote/UK-wide jobs go to `Other`, and jobs whose town can't be placed go to `Needs Review`. |
+| A company to `Company Regions` | Its rows in `Other` move to `New Leads` with that region's Staff ID. Rows already in `New Leads` keep their consultant. |
+
+- A job that moves is removed from its old tab, so each job is only ever in one tab.
+- **Removing** an entry from a list doesn't move anything back. It only stops future jobs being affected.
+- The blocklists still win. Unfilter never pulls out a job that was filtered by a blocklist, or one whose company or title is on a blocklist now.
+- If the AI can't be reached when placing unfiltered jobs, they stay in `Filtered Out` and are tried again on the next run. Nothing gets lost.
+
+**Don't want to wait for the morning run?** After editing a list, run `applyListsNow` in the Apps Script editor. It applies the lists straight away and doesn't fetch any new emails.
+
+## v20 — superseded (`git show e4c7561:Code.gs`)
 
 **New `Unfilter Company` tab.** For companies the AI filters out by mistake. If the AI filters a job from a company on this list, the job goes to New Leads as normal, with the right consultant's Staff ID. You fill the list in yourself, and matching works the same way as the blocklists: exact, ignoring case and punctuation.
 - If the AI can't place the job's location, it goes to `Needs Review` instead ("Unfilter Company, but AI gave no usable region"). Remote/UK-wide jobs go to `Other`, same as any other job.
 - The manual `Company Blocklist` and `Job Title Blocklist` still win. A company on both Unfilter and the blocklist stays filtered, and so does a blocklisted job title at an unfiltered company.
-- Jobs the AI already filtered on an earlier run come back into New Leads on the next run, provided their email is still within the 4-day lookback. Their old `Filtered Out` row stays as a record. Older jobs won't come back.
+- Jobs the AI already filtered on an earlier run came back into New Leads on the next run, provided their email was still within the 4-day lookback, and their old `Filtered Out` row stayed as a record. (v21 replaces this: older jobs come back too, and the old row is removed.)
 
 **Bournemouth, Poole and Christchurch → Southern Home Counties (Ray),** not South West (Josh). The AI is told this, and the script also corrects it if the AI still says South West.
 
