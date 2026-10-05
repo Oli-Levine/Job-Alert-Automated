@@ -4,7 +4,30 @@ This repo holds a single Google Apps Script file, **`Code.gs`**, that automates 
 
 > Earlier on, this project renamed the file itself on every rewrite (`V17` → `V18`). That's retired: it duplicated what git already tracks for free, and made it easy to lose track of where an old version went. This doc exists to cover the versions from before that retirement; going forward, `git log` and the header comment's changelog are enough.
 
-## v21 — current (`Code.gs`)
+## v22 — current (`Code.gs`)
+
+**New `Job Description` column on New Leads (column G).** `Staff ID` moves from G to **H**. Existing rows are moved across automatically on the first run, so no Staff IDs are lost. Update the CRM import mapping to match.
+
+**Where the descriptions come from.** They're downloaded from the job page, never written by the AI:
+- **LinkedIn:** taken straight from LinkedIn's public job page. Free.
+- **Indeed:** Indeed blocks direct downloads, so the script uses Apify's Indeed scraper, at about $3 per 1,000 jobs (Apify's free plan includes about $5 a month). Only real new leads are sent, never filtered jobs or ones already in the sheet.
+- If a description can't be retrieved, the cell says `FETCH FAILED (reason)`. Nothing is ever made up.
+
+**Which leads get one:** leads found in the **last 7 days**, and **never anything found before 3 October 2026**, so older rows are left alone. A `FETCH FAILED` from inside those 7 days is retried by the next morning's run.
+
+**How the morning works now** (so nothing times out):
+- **~7:30:** pulls in new jobs and fills the LinkedIn descriptions. It asks Apify for the Indeed ones without waiting, so those cells say `PENDING` for now.
+- **~8:30:** collects the Indeed descriptions from Apify (waiting a few minutes if needed), fills any gaps, then emails Mark and Valeriia. The `.xlsx` and the live sheet both include the descriptions, and the email says how many recent leads have one.
+- Each email alert now goes to the AI only once, instead of on every run for 4 days. That makes each run faster and cheaper.
+- If a run gets close to Google's 6-minute limit, it stops starting new work and leaves the rest for the next run, instead of crashing halfway.
+
+**One-time setup:**
+1. In Apify, open the **misceres~indeed-scraper** page and click **Try for free**.
+2. In the Apps Script editor, go to **Project Settings → Script Properties** and add `APIFY_TOKEN`. The value is your token from Apify → Settings → API & Integrations.
+3. Run `debugIndeedDescriptions` once. It sends up to three Indeed leads to Apify and logs what comes back, without changing the sheet. This checks the Indeed route works before the morning run relies on it.
+4. Optionally, run `fillJobDescriptionsNow` to fill the current leads straight away.
+
+## v21 — superseded (`git show 3c4d6d0:Code.gs`)
 
 **Editing a list now moves jobs that are already in the sheet,** not just future ones. Every daily run starts by checking existing rows against your lists:
 
