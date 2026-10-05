@@ -1251,13 +1251,16 @@ function debugIndeedDescriptions() {
 }
 
 // One-off experiment for sponsored Indeed jobs, whose ad links carry no job
-// ID and which Indeed won't open for Apps Script. Takes up to three sponsored
-// leads from New Leads and runs two Apify tests side by side, logging what
-// comes back. Writes nothing to the sheet; costs a few pence.
-//   Test A: give Apify the ad links themselves, to see if its browser can
-//           follow them through to the job.
-//   Test B: search Indeed for each job's title + company in its town, to see
-//           if a result with the same company and title comes back.
+// ID and which Indeed won't open (403), even via Apify. Searching Indeed via
+// Apify does find them, so this compares three ways of searching on up to
+// three sponsored leads from New Leads, all run side by side, and logs which
+// finds each job. Writes nothing to the sheet; costs well under £1.
+//   company+town   — the company's name, in the job's town
+//   title+town     — the job title (minus any bracketed extras), in the town
+//   title+company  — both together, anywhere in the UK
+// A match is "exact" if company and title match after normalising case and
+// punctuation, "loose" if they still match ignoring Ltd/Limited/PLC/LLP and
+// bracketed extras, or one title contains the other.
 function debugSponsoredIndeed() {
   runStartedAt = Date.now();
   const token = PropertiesService.getScriptProperties().getProperty('APIFY_TOKEN');
@@ -1271,44 +1274,44 @@ function debugSponsoredIndeed() {
   const titleOf = item => pick(item, ['positionName', 'title', 'jobTitle', 'displayTitle']);
   const companyOf = item => pick(item, ['company', 'companyName', 'employer']);
   const descLength = item => { const f = APIFY_DESCRIPTION_FIELDS.find(k => item[k]); return f ? String(item[f]).length : 0; };
-  const start = (label, urls, maxItems) => {
-    const res = apifyRequest(token, 'post', `/acts/${DESCRIPTION_CONFIG.APIFY_ACTOR}/runs`, { startUrls: urls.map(u => ({ url: u })), maxItems: maxItems });
-    if (res.error) { Logger.log(`${label}: couldn't start Apify — ${res.error}`); return null; }
-    Logger.log(`${label}: Apify run ${res.data.id} started.`);
-    return { runId: res.data.id, datasetId: res.data.defaultDatasetId };
-  };
+  const shortTitle = t => String(t).replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim();
+  const looseCompany = c => normalizeText(c).replace(/\b(ltd|limited|plc|llp|inc)\b/g, '').replace(/\s+/g, ' ').trim();
+  const looseTitle = t => normalizeText(shortTitle(t));
+  const town = r => (/remote|uk-?wide|nationwide|united kingdom/i.test(String(r[3])) ? '' : String(r[3] || ''));
+  const search = (q, l) => `https://uk.indeed.com/jobs?q=${encodeURIComponent(q)}${l ? `&l=${encodeURIComponent(l)}` : ''}`;
 
-  const runA = start('Test A (ad links)', leads.map(r => r[5]), leads.length);
-  const searchUrl = r => {
-    const town = /remote|uk-?wide|nationwide|united kingdom/i.test(String(r[3])) ? '' : String(r[3] || '');
-    return `https://uk.indeed.com/jobs?q=${encodeURIComponent(`${r[1]} ${r[2]}`)}${town ? `&l=${encodeURIComponent(town)}` : ''}`;
-  };
-  const runB = start('Test B (Indeed search)', leads.map(searchUrl), leads.length * 10);
+  const variants = [
+    { name: 'company+town', url: r => search(r[2], town(r)) },
+    { name: 'title+town', url: r => search(shortTitle(r[1]), town(r)) },
+    { name: 'title+company', url: r => search(`${shortTitle(r[1])} ${r[2]}`, '') }
+  ];
+  variants.forEach(v => {
+    const urls = leads.map(v.url);
+    const res = apifyRequest(token, 'post', `/acts/${DESCRIPTION_CONFIG.APIFY_ACTOR}/runs`, { startUrls: urls.map(u => ({ url: u })), maxItems: leads.length * 15 });
+    if (res.error) { Logger.log(`${v.name}: couldn't start Apify — ${res.error}`); return; }
+    v.run = { runId: res.data.id, datasetId: res.data.defaultDatasetId };
+    Logger.log(`${v.name}: Apify run ${v.run.runId} started. Searches: ${urls.join(' , ')}`);
+  });
+
   const deadline = Date.now() + 240 * 1000;
-
-  if (runA) {
-    const res = apifyRunItems(token, runA, deadline);
-    if (!res) Logger.log('Test A: still running after 4 minutes — check it in the Apify console.');
-    else if (res.error) Logger.log(`Test A: ${res.error}`);
-    else {
-      Logger.log(`Test A: run ${res.status}, ${res.items.length} result(s) for ${leads.length} ad link(s).`);
-      if (res.items.length) Logger.log(`Test A first result: ${JSON.stringify(res.items[0]).substring(0, 600)}`);
-      res.items.forEach((it, i) => Logger.log(`Test A result ${i + 1}: ${titleOf(it)} | ${companyOf(it)} | description ${descLength(it)} chars`));
-    }
-  }
-  if (runB) {
-    const res = apifyRunItems(token, runB, deadline);
-    if (!res) Logger.log('Test B: still running after 4 minutes — check it in the Apify console.');
-    else if (res.error) Logger.log(`Test B: ${res.error}`);
-    else {
-      Logger.log(`Test B: run ${res.status}, ${res.items.length} search result(s).`);
-      leads.forEach((r, i) => {
-        const match = res.items.find(it => normalizeText(titleOf(it)) === normalizeText(r[1]) && normalizeText(companyOf(it)) === normalizeText(r[2]));
-        const sameCompany = res.items.filter(it => normalizeText(companyOf(it)) === normalizeText(r[2])).length;
-        Logger.log(`Test B lead ${i + 1} (${r[1]} | ${r[2]}): ${match ? `exact match found, description ${descLength(match)} chars` : `no exact match (${sameCompany} result(s) from the same company)`}`);
+  variants.filter(v => v.run).forEach(v => {
+    const res = apifyRunItems(token, v.run, deadline);
+    if (!res) { Logger.log(`${v.name}: still running after 4 minutes — check it in the Apify console.`); return; }
+    if (res.error) { Logger.log(`${v.name}: ${res.error}`); return; }
+    Logger.log(`${v.name}: run ${res.status}, ${res.items.length} result(s).`);
+    leads.forEach((r, i) => {
+      const exact = res.items.find(it => normalizeText(titleOf(it)) === normalizeText(r[1]) && normalizeText(companyOf(it)) === normalizeText(r[2]));
+      const sameCompany = res.items.filter(it => looseCompany(companyOf(it)) === looseCompany(r[2]));
+      const loose = sameCompany.find(it => {
+        const a = looseTitle(titleOf(it)), b = looseTitle(r[1]);
+        return a === b || (a && b && (a.includes(b) || b.includes(a)));
       });
-    }
-  }
+      const outcome = exact ? `EXACT match, description ${descLength(exact)} chars`
+        : loose ? `LOOSE match "${titleOf(loose)} | ${companyOf(loose)}", description ${descLength(loose)} chars`
+        : `no match (${sameCompany.length} result(s) from the same company${sameCompany.length ? `: ${sameCompany.slice(0, 3).map(titleOf).join(' / ')}` : ''})`;
+      Logger.log(`${v.name} — lead ${i + 1}: ${outcome}`);
+    });
+  });
 }
 
 // One line for the daily email about leads inside the description window.
