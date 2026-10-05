@@ -1,7 +1,16 @@
 /**
- * JOB ALERT AUTOMATION v22
+ * JOB ALERT AUTOMATION v23
  * ------------------------------------------------------------
- * CHANGES FROM v21:
+ * CHANGES FROM v22:
+ *   - New Leads rows are forced to single-line height. Sheets grows a row to
+ *     show every line of a multi-line cell regardless of wrap/clip, so
+ *     LinkedIn descriptions were making rows very tall. The full text is
+ *     still in the cell.
+ *   - A failed Apify call now writes Apify's own error message into the
+ *     FETCH FAILED cell (not "see logs"), and every collected run logs its
+ *     status, result count and result field names.
+ *
+ * CHANGES FROM v21 (carried forward):
  *   - NEW "Job Description" column on New Leads (column G). Staff ID moves
  *     from G to H; existing rows are re-laid out automatically on the first
  *     run (ensureNewLeadsLayout()).
@@ -22,14 +31,6 @@
  *   - Emails already processed are skipped (PROCESSED_MESSAGES_KEY), so each
  *     alert goes to Claude once instead of on every run of its 4-day window.
  *   - The daily email says how many recent leads have a description.
- *
- * CHANGES FROM v20 (carried forward):
- *   - List changes apply to rows already in the sheet (applyListChanges(),
- *     every run and via applyListsNow()): blocklists move rows to Filtered
- *     Out; Unfilter Company moves AI-filtered rows out (AI region lookup);
- *     Company Regions moves rows from Other to New Leads. Moved rows leave
- *     their old tab; removing a list entry moves nothing back.
- *   - Region rules live in one shared REGION_RULES block.
  */
 
 const CONFIG = {
@@ -803,6 +804,10 @@ function rebuildNewLeadsTab(sheet, newRows) {
     const dataStartRow = 2;
     sheet.getRange(dataStartRow, 1, combined.length, numCols).setValues(combined);
     sheet.getRange(dataStartRow, 5, combined.length, 1).setNumberFormat('dd/mm/yyyy hh:mm');
+    // Sheets grows a row to show every line of a multi-line cell, whatever
+    // the wrap setting, so descriptions would make rows very tall. Forcing the
+    // height keeps every lead on one line; the full text is still in the cell.
+    sheet.setRowHeightsForced(dataStartRow, combined.length, NEW_LEADS_ROW_HEIGHT_PX);
   }
 
   // Auto-sizing the description column would stretch it to the longest
@@ -815,6 +820,7 @@ function rebuildNewLeadsTab(sheet, newRows) {
 }
 
 const DESCRIPTION_COLUMN_WIDTH_PX = 300;
+const NEW_LEADS_ROW_HEIGHT_PX = 21; // Sheets' default single-line row height
 
 // New Leads in an older layout (Staff ID in G) is converted before anything
 // appends rows to it, so new and old rows never end up mixed.
@@ -1084,6 +1090,8 @@ function finishApifyRun(token, run, deadline) {
   if (items.error) return stale ? failAll(items.error) : null;
   const list = Array.isArray(items.data) ? items.data : [];
   const runNote = status === 'SUCCEEDED' ? '' : `; Apify run ${status}`;
+  Logger.log(`Apify run ${run.runId} ${status}: ${list.length} result(s) for ${run.jks.length} job(s).`
+    + (list.length ? ` Fields in first result: ${Object.keys(list[0]).join(', ')}` : ''));
 
   return new Map(run.jks.map(jk => {
     // The field holding the job ID varies, so match on the whole result.
@@ -1110,15 +1118,18 @@ function apifyRequest(token, method, path, payload) {
     response = UrlFetchApp.fetch(DESCRIPTION_CONFIG.APIFY_API + path, options);
   } catch (err) {
     Logger.log(`Apify request failed (${path}): ${err}`);
-    return { error: 'Apify request failed — see logs' };
+    return { error: `Apify request failed: ${String(err).substring(0, 150)}` };
   }
   const code = response.getResponseCode();
   const body = response.getContentText();
   if (code < 200 || code >= 300) {
-    // 401 = bad token; 402/403 usually = out of credit, or the scraper hasn't
-    // been added to the Apify account yet ("Try for free" on its page).
+    // 401 = bad token; 402/403 usually = out of credit, the scraper's free
+    // trial has ended, or it hasn't been added to the Apify account yet.
+    // Apify's own message goes into the cell so the cause is visible there.
     Logger.log(`Apify returned status ${code} for ${path}: ${body.substring(0, 500)}`);
-    return { error: `Apify returned status ${code} — see logs` };
+    let message = '';
+    try { message = JSON.parse(body).error.message || ''; } catch (e) { message = body; }
+    return { error: `Apify returned status ${code}: ${String(message).substring(0, 150)}` };
   }
   try {
     const parsed = JSON.parse(body);
