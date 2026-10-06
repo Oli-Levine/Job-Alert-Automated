@@ -144,6 +144,7 @@ function itCollect(waitSecs) {
     const runNote = info.status === 'SUCCEEDED' ? '' : `Apify run ${info.status}${info.statusMessage ? `: ${info.statusMessage}` : ''}`;
     Logger.log(`${run.type}: run ${info.status}${info.statusMessage ? ` (${info.statusMessage})` : ''}, ${items.length} result(s). ${link}`);
     if (items.length) Logger.log(`First result: ${JSON.stringify(items[0]).substring(0, 1500)}`);
+    if (info.status !== 'SUCCEEDED') Logger.log(`${run.type}: end of Apify's log for this run:\n${itRunLog(token, run.runId)}`);
     itWriteRaw(run, info.status, items);
     itWriteResults(sheet, run, items, runNote, res.error);
   });
@@ -215,6 +216,17 @@ function itWaitForRun(token, runId, deadline) {
     const status = poll.data.status;
     if (status !== 'READY' && status !== 'RUNNING') return { status: status, statusMessage: poll.data.statusMessage || '' };
     if (Date.now() >= deadline) return null;
+  }
+}
+
+// The last part of a run's own log, which says why a run failed.
+function itRunLog(token, runId) {
+  try {
+    const res = UrlFetchApp.fetch(`${IT_CONFIG.APIFY_API}/logs/${runId}`, { headers: { Authorization: `Bearer ${token}` }, muteHttpExceptions: true });
+    const text = res.getContentText();
+    return res.getResponseCode() === 200 ? text.slice(-3000) : `(couldn't read the log: status ${res.getResponseCode()})`;
+  } catch (err) {
+    return `(couldn't read the log: ${err})`;
   }
 }
 
