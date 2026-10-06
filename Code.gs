@@ -9,12 +9,6 @@
  *   - A failed Apify call now writes Apify's own error message into the
  *     FETCH FAILED cell (not "see logs"), and every collected run logs its
  *     status, result count and result field names.
- *   - Sponsored Indeed jobs now get descriptions too. Their links are
- *     ad-tracking redirects with no job ID, so they used to fail with "Indeed
- *     link has no job ID" (the earlier Apify test skipped them silently).
- *     resolveIndeedJobKeys() reads where each redirect points, without
- *     opening the blocked job page, to get the ID; the row's Link becomes
- *     the clean viewjob link and the job goes to Apify as normal.
  *
  * CHANGES FROM v21 (carried forward):
  *   - NEW "Job Description" column on New Leads (column G). Staff ID moves
@@ -868,7 +862,7 @@ function linkedInJobId(link) {
 function indeedJobKey(link) {
   const s = String(link || '');
   if (!/indeed\.com/i.test(s)) return null;
-  const m = s.match(/[?&]v?jk=([^&#]+)/);
+  const m = s.match(/[?&]jk=([^&#]+)/);
   return m ? m[1] : null;
 }
 
@@ -882,12 +876,6 @@ function fillJobDescriptions(sheet, retryFailed) {
   const updates = new Map(); // row index -> new cell text
   const linkedIn = [];
   const indeedRowsByJk = new Map();
-  const sponsoredIndeed = []; // Indeed rows whose link has no job ID
-  const queueIndeed = (i, jk) => {
-    if (trackedJks.has(jk)) { updates.set(i, DESCRIPTION_PENDING); return; } // already in a running Apify run
-    if (!indeedRowsByJk.has(jk)) indeedRowsByJk.set(jk, []);
-    indeedRowsByJk.get(jk).push(i);
-  };
 
   rows.forEach((row, i) => {
     if (!inDescriptionWindow(row[4])) return;
@@ -901,9 +889,11 @@ function fillJobDescriptions(sheet, retryFailed) {
     if (linkedInJobId(row[5])) {
       linkedIn.push(i);
     } else if (jk) {
-      queueIndeed(i, jk);
+      if (trackedJks.has(jk)) { updates.set(i, DESCRIPTION_PENDING); return; } // already in a running Apify run
+      if (!indeedRowsByJk.has(jk)) indeedRowsByJk.set(jk, []);
+      indeedRowsByJk.get(jk).push(i);
     } else if (/indeed\.com/i.test(String(row[5]))) {
-      sponsoredIndeed.push(i);
+      updates.set(i, `${DESCRIPTION_FAILED} (Indeed link has no job ID)`);
     } else {
       updates.set(i, `${DESCRIPTION_FAILED} (no LinkedIn or Indeed job link)`);
     }
@@ -922,78 +912,13 @@ function fillJobDescriptions(sheet, retryFailed) {
     batch.forEach((i, k) => updates.set(i, texts[k]));
   }
 
-  // Sponsored Indeed links are ad-tracking redirects with no job ID in them.
-  // Indeed's redirect points at the job page, which does carry the ID, so
-  // read where it points (without following it to the blocked page). The
-  // row's Link is replaced with the clean job link, so the Apify result can
-  // be matched back to it and the CRM gets a link that doesn't expire.
-  const linkUpdates = new Map(); // row index -> clean Indeed job link
-  if (sponsoredIndeed.length && timeLeftMs() >= 60 * 1000) {
-    const resolved = resolveIndeedJobKeys(sponsoredIndeed.map(i => rows[i][5]));
-    sponsoredIndeed.forEach((i, k) => {
-      const r = resolved[k];
-      if (!r.jk) { updates.set(i, `${DESCRIPTION_FAILED} (${r.reason})`); return; }
-      linkUpdates.set(i, indeedViewUrl(r.jk));
-      queueIndeed(i, r.jk);
-    });
-  }
-
   if (indeedRowsByJk.size > 0) {
     const started = startApifyRun([...indeedRowsByJk.keys()]);
     const text = started.error ? `${DESCRIPTION_FAILED} (${started.error})` : DESCRIPTION_PENDING;
     indeedRowsByJk.forEach(indexes => indexes.forEach(i => updates.set(i, text)));
   }
 
-  linkUpdates.forEach((link, i) => sheet.getRange(i + 2, 6).setValue(link));
   writeDescriptions(sheet, updates);
-}
-
-// For Indeed links with no job ID (sponsored ad-tracking links), reads each
-// redirect's destination — up to 3 hops, never downloading the job page
-// itself, which Indeed blocks — and returns [{ jk } or { reason }] in order.
-function resolveIndeedJobKeys(links) {
-  const current = links.slice();
-  const results = links.map(() => null);
-  for (let hop = 0; hop < 3; hop++) {
-    const open = current.map((url, k) => k).filter(k => !results[k]);
-    if (!open.length) break;
-    const responses = fetchAllSafely(open.map(k => ({ url: current[k], followRedirects: false, muteHttpExceptions: true })), 'Indeed redirect');
-    open.forEach((k, n) => {
-      const res = responses[n];
-      if (!res) { results[k] = { reason: 'Indeed sponsored link could not be opened — see logs' }; return; }
-      const code = res.getResponseCode();
-      const headers = res.getAllHeaders();
-      let next = String(headers.Location || headers.location || '');
-      if (next.startsWith('/')) next = `https://uk.indeed.com${next}`;
-      if (code >= 300 && code < 400 && next) {
-        const jk = indeedJobKey(next);
-        if (jk) results[k] = { jk: jk };
-        else if (/indeed\.com/i.test(next)) current[k] = next; // another Indeed redirect — follow it
-        else results[k] = { reason: "Indeed sponsored link goes to the employer's own site, not an Indeed job page" };
-      } else {
-        const inBody = code === 200 ? res.getContentText().match(/[?&]v?jk=([0-9a-f]{16})/) : null;
-        results[k] = inBody ? { jk: inBody[1] } : { reason: `Indeed sponsored link has no job ID, and Indeed returned status ${code} when it was opened` };
-      }
-    });
-  }
-  return results.map(r => r || { reason: 'Indeed sponsored link has no job ID (too many redirects)' });
-}
-
-// UrlFetchApp.fetchAll throws if any one request fails outright, so on
-// failure retry one by one; a request that still fails comes back as null.
-function fetchAllSafely(requests, label) {
-  try {
-    return UrlFetchApp.fetchAll(requests);
-  } catch (err) {
-    return requests.map(req => {
-      try {
-        return UrlFetchApp.fetch(req.url, req);
-      } catch (e) {
-        Logger.log(`${label} request failed for ${req.url}: ${e}`);
-        return null;
-      }
-    });
-  }
 }
 
 function writeDescriptions(sheet, updates) {
@@ -1010,7 +935,21 @@ function fetchLinkedInDescriptions(links) {
     muteHttpExceptions: true,
     followRedirects: true
   }));
-  return fetchAllSafely(requests, 'LinkedIn download').map(linkedInDescriptionFromResponse);
+  let responses;
+  try {
+    responses = UrlFetchApp.fetchAll(requests);
+  } catch (err) {
+    // fetchAll throws if any one request fails outright, so retry one by one.
+    responses = requests.map(req => {
+      try {
+        return UrlFetchApp.fetch(req.url, req);
+      } catch (e) {
+        Logger.log(`LinkedIn download failed for ${req.url}: ${e}`);
+        return null;
+      }
+    });
+  }
+  return responses.map(linkedInDescriptionFromResponse);
 }
 
 function linkedInDescriptionFromResponse(response) {
