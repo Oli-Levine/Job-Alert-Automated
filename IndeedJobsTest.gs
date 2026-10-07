@@ -9,8 +9,8 @@
  * Two Apify runs, started together:
  *   - Jobs with a job ID (ordinary ones) go to misceres~indeed-scraper as the
  *     clean job link, matched back by job ID. Confirmed working.
- *   - Sponsored jobs (no job ID) go to a real browser (apify~web-scraper,
- *     UK residential proxy) that opens the ad link as it is in the email,
+ *   - Sponsored jobs (no job ID) go to a real browser on Apify (Web Scraper,
+ *     or Puppeteer / Playwright Scraper if that's refused; UK residential proxy) that opens the ad link as it is in the email,
  *     follows it to the job page and reads the description there. The Indeed
  *     scraper itself fails whole runs given ad links, so it's not used for them.
  *     If the browser only gets the job ID, that's saved on the row and the next
@@ -21,8 +21,9 @@
  * Use it in a test Google Sheet: Extensions > Apps Script, paste this in as
  * its own file, add Script Property APIFY_TOKEN (Project Settings), then:
  *   ijLoadJobs()          — adds up to 10 new jobs from the emails (free).
- *   ijCountJobs()         — logs ordinary vs sponsored counts for every Indeed
- *                           email in the window, no cap (free, writes nothing).
+ *   ijCountJobs()         — ordinary vs sponsored counts for every Indeed email
+ *                           in the window, no cap, on an "Indeed Counts" tab
+ *                           (free; no Apify).
  *                           ijCountJobs14Days() does the same for 14 days.
  *   ijFetchDescriptions() — fills descriptions for rows with none yet (or a
  *                           FETCH FAILED), waiting up to 4 minutes for Apify.
@@ -35,9 +36,13 @@ const IJ_CONFIG = {
   EMAIL_DAYS: 4,      // how far back to look, like the daily run
   MAX_JOBS: 10,       // most jobs added (and sent to Apify) per run, to keep tests quick and cheap
   TAB: 'Indeed Jobs',
+  COUNTS_TAB: 'Indeed Counts', // written by ijCountJobs()
   APIFY_API: 'https://api.apify.com/v2',
   APIFY_ACTOR: 'misceres~indeed-scraper',
-  BROWSER_ACTOR: 'apify~web-scraper',
+  // Browser actors for sponsored ad links, tried in this order. Apify refuses API
+  // runs of an actor needing "full access" until it's approved in the console,
+  // so if one is refused the next is tried. All three are Apify's own.
+  BROWSER_ACTORS: ['apify~web-scraper', 'apify~puppeteer-scraper', 'apify~playwright-scraper'],
   BROWSER_MEMORY_MB: 2048,
   // UK home-broadband IPs look like a normal visitor; Indeed blocks data-centre IPs.
   // If Apify says the RESIDENTIAL group isn't available on the plan, use { useApifyProxy: true }.
@@ -104,7 +109,7 @@ function ijLoadJobs() {
 }
 
 // Counts ordinary vs sponsored jobs in every Indeed email of the last `days`
-// days (default EMAIL_DAYS), with no cap. Only logs; writes nothing, no Apify.
+// days (default EMAIL_DAYS), with no cap, to the log and an "Indeed Counts" tab. No Apify.
 function ijCountJobs(days) {
   days = Number(days) || IJ_CONFIG.EMAIL_DAYS;
   const messages = [];
@@ -113,17 +118,33 @@ function ijCountJobs(days) {
   messages.sort((a, b) => b.getDate() - a.getDate());
   const pct = (n, of) => (of ? Math.round(100 * n / of) : 0) + '%';
   let emails = 0, total = 0, sponsored = 0;
+  const rows = [];
   messages.forEach(msg => {
     const html = msg.getBody();
     if (!ijIsIndeedEmail(html)) return;
     const jobs = ijJobsInEmail(html);
     const s = jobs.filter(j => !j.jobId).length;
     emails++; total += jobs.length; sponsored += s;
+    rows.push([msg.getDate(), msg.getSubject(), jobs.length, jobs.length - s, s, pct(s, jobs.length)]);
     Logger.log(`${msg.getDate().toLocaleString('en-GB')} "${msg.getSubject()}": ${jobs.length} job(s), `
       + `${jobs.length - s} ordinary, ${s} sponsored (${pct(s, jobs.length)}).`);
   });
-  Logger.log(`TOTAL over the last ${days} days: ${emails} Indeed email(s), ${total} job(s): `
-    + `${total - sponsored} ordinary, ${sponsored} sponsored (${pct(sponsored, total)} sponsored).`);
+  const summary = `TOTAL over the last ${days} days: ${emails} Indeed email(s), ${total} job(s): `
+    + `${total - sponsored} ordinary, ${sponsored} sponsored (${pct(sponsored, total)} sponsored).`;
+  Logger.log(summary);
+
+  // Also onto an "Indeed Counts" tab (replaced on every run), total first.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(IJ_CONFIG.COUNTS_TAB) || ss.insertSheet(IJ_CONFIG.COUNTS_TAB);
+  sheet.clear();
+  const table = [
+    [`TOTAL (last ${days} days, ${emails} emails)`, '', total, total - sponsored, sponsored, pct(sponsored, total)],
+    ['Email Date', 'Subject', 'Jobs', 'Ordinary', 'Sponsored', 'Sponsored %'],
+    ...rows
+  ];
+  sheet.getRange(1, 1, table.length, 6).setValues(table);
+  sheet.getRange(1, 1, 2, 6).setFontWeight('bold');
+  Logger.log(`Counts written to the "${IJ_CONFIG.COUNTS_TAB}" tab.`);
 }
 
 // The editor's Run button can't pass a number, so this gives a bigger sample.
@@ -190,16 +211,22 @@ function ijFetchDescriptions() {
   }
   if (byBrowser.length) {
     const links = [...new Set(byBrowser.map(x => String(x.r[IJ_COL.LINK])))];
-    ijStartRun(token, sheet, byBrowser, 'browser', 'Browser (sponsored ad links)', IJ_CONFIG.BROWSER_ACTOR, `&memory=${IJ_CONFIG.BROWSER_MEMORY_MB}`, {
+    const common = {
       startUrls: links.map(u => ({ url: u, userData: { link: u } })),
-      pageFunction: IJ_PAGE_FUNCTION,
       proxyConfiguration: IJ_CONFIG.BROWSER_PROXY,
-      injectJQuery: false,
-      waitUntil: ['domcontentloaded'],
       maxRequestRetries: 2,
       maxPagesPerCrawl: links.length,
       pageLoadTimeoutSecs: 60
-    });
+    };
+    for (const actor of IJ_CONFIG.BROWSER_ACTORS) {
+      // Web Scraper runs pageFunction inside the page; the other two run it in Node with a `page` object.
+      const input = actor === 'apify~web-scraper'
+        ? Object.assign({ pageFunction: IJ_PAGE_FUNCTION, injectJQuery: false, waitUntil: ['domcontentloaded'] }, common)
+        : Object.assign({ pageFunction: IJ_NODE_PAGE_FUNCTION }, common);
+      const last = actor === IJ_CONFIG.BROWSER_ACTORS[IJ_CONFIG.BROWSER_ACTORS.length - 1];
+      if (ijStartRun(token, sheet, byBrowser, 'browser', `Browser ${actor} (sponsored ad links)`, actor, `&memory=${IJ_CONFIG.BROWSER_MEMORY_MB}`, input, !last)) break;
+      Logger.log(`Trying the next browser actor.`);
+    }
   }
   ijCollect(IJ_CONFIG.WAIT_SECS);
 }
@@ -225,18 +252,42 @@ const IJ_PAGE_FUNCTION = `async function pageFunction(context) {
   };
 }`;
 
-function ijStartRun(token, sheet, group, kind, label, actor, extraQuery, input) {
+// The same, for Puppeteer Scraper / Playwright Scraper, which run pageFunction
+// in Node and hand it the browser `page`.
+const IJ_NODE_PAGE_FUNCTION = `async function pageFunction(context) {
+  const { page, request } = context;
+  let description = null;
+  try {
+    await page.waitForSelector('#jobDescriptionText', { timeout: 15000 });
+    description = await page.$eval('#jobDescriptionText', el => el.innerText.trim());
+  } catch (e) { /* no description box on this page */ }
+  const canonical = await page.$eval('link[rel="canonical"]', el => el.href).catch(() => null);
+  const jk = s => { const m = String(s || '').match(/[?&]v?jk=([0-9a-f]{16})/i); return m ? m[1] : null; };
+  return {
+    link: request.userData.link,
+    finalUrl: page.url(),
+    jobId: jk(page.url()) || jk(canonical),
+    pageTitle: await page.title(),
+    description: description
+  };
+}`;
+
+// Starts one Apify run for these rows and remembers it. Returns true if it
+// started. If it didn't and `quiet` is set, the rows are left alone (the
+// caller is trying another actor); otherwise they get FETCH FAILED.
+function ijStartRun(token, sheet, group, kind, label, actor, extraQuery, input, quiet) {
   const res = ijApify(token, 'post', `/acts/${actor}/runs?timeout=${IJ_CONFIG.RUN_TIMEOUT_SECS}${extraQuery}`, input);
   if (res.error) {
     Logger.log(`${label}: couldn't start Apify: ${res.error}`);
-    group.forEach(x => ijSet(sheet, x.i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (couldn't start Apify: ${res.error})`));
-    return;
+    if (!quiet) group.forEach(x => ijSet(sheet, x.i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (couldn't start Apify: ${res.error})`));
+    return false;
   }
   group.forEach(x => ijSet(sheet, x.i, IJ_COL.DESC_STATUS, IJ_PENDING));
   const runs = ijLoadRuns();
   runs.push({ kind: kind, label: label, runId: res.data.id, datasetId: res.data.defaultDatasetId, links: group.map(x => String(x.r[IJ_COL.LINK])) });
   ijSaveRuns(runs);
   Logger.log(`${label}: Apify run started for ${group.length} job(s): ${ijRunLink(res.data.id)}`);
+  return true;
 }
 
 // Writes the results of every finished run into its PENDING rows. Runs still
@@ -374,7 +425,7 @@ function ijApify(token, method, path, payload) {
     Logger.log(`Apify returned ${code} for ${path}: ${body.substring(0, 1000)}`);
     let message = body;
     try { message = JSON.parse(body).error.message || body; } catch (e) { /* keep the raw reply */ }
-    return { error: `status ${code}: ${String(message).substring(0, 200)}` };
+    return { error: `status ${code}: ${String(message).substring(0, 300)}` };
   }
   try {
     const parsed = JSON.parse(body);
