@@ -1,36 +1,52 @@
 /**
- * JOB ALERT AUTOMATION v23
+ * JOB ALERT AUTOMATION v24
  * ------------------------------------------------------------
- * CHANGES FROM v22:
- *   - New Leads rows are forced to single-line height. Sheets grows a row to
- *     show every line of a multi-line cell regardless of wrap/clip, so
- *     LinkedIn descriptions were making rows very tall. The full text is
- *     still in the cell.
- *   - A failed Apify call now writes Apify's own error message into the
- *     FETCH FAILED cell (not "see logs"), and every collected run logs its
- *     status, result count and result field names.
- *
- * CHANGES FROM v21 (carried forward):
- *   - NEW "Job Description" column on New Leads (column G). Staff ID moves
- *     from G to H; existing rows are re-laid out automatically on the first
- *     run (ensureNewLeadsLayout()).
- *   - Descriptions are downloaded, never written by the AI:
- *       - LinkedIn: the public guest job page
- *         (jobs-guest/jobs/api/jobPosting/<id>), several in parallel.
- *       - Indeed: blocks direct downloads, so one Apify run
- *         (misceres~indeed-scraper) per batch, matched back by job ID (jk).
- *         Needs Script Property APIFY_TOKEN.
+ * CHANGES FROM v21 (v22 and v23 were abandoned; this is v21 plus job
+ * descriptions, built afresh. The old versions are in git history):
+ *   - NEW "Job Description" column on New Leads, column H, after Staff ID.
+ *     Columns A–G are unchanged, so the CRM import mapping still works.
+ *   - Descriptions are downloaded, never written by the AI, for the rows
+ *     each run adds to New Leads from the emails, all in the same run:
+ *       - LinkedIn: LinkedIn's public job page (no API, no Apify, no AI).
+ *       - Indeed (ordinary jobs, with a job ID in the link): Apify's Indeed
+ *         scraper (misceres~indeed-scraper; Script Property APIFY_TOKEN).
+ *         Started as soon as each Indeed email's new leads are known, so it
+ *         runs while the remaining emails are processed, then collected
+ *         before the run ends.
+ *       - Indeed sponsored jobs (ad links, no job ID): not fetched; the
+ *         cell says "No description (sponsored Indeed ad)". Apify's Indeed
+ *         scraper rejects ad links and Indeed blocks Apps Script.
  *     Anything that can't be retrieved says "FETCH FAILED (reason)".
- *   - Only leads found in the last 7 days, and never before 3 Oct 2026, are
- *     filled (DESCRIPTION_CONFIG). FETCH FAILED cells are retried by the
- *     07:30 run while still inside that window.
- *   - Timeouts: Apify takes 1–3 minutes, so the 07:30 run starts it and
- *     moves on (cells say PENDING), and the 08:30 runDailySend() collects
- *     the results before exporting. Both runs stop starting new work near
- *     5 minutes (RUN_TIME_BUDGET_MS); leftovers are picked up next run.
- *   - Emails already processed are skipped (PROCESSED_MESSAGES_KEY), so each
- *     alert goes to Claude once instead of on every run of its 4-day window.
- *   - The daily email says how many recent leads have a description.
+ *   - Apps Script stops a run at 6 minutes, so descriptions use only the
+ *     time left (RUN_TIME_BUDGET_MS); an Apify run that hasn't finished by
+ *     then is stopped (so it isn't charged further) and its leads are marked
+ *     FETCH FAILED. New leads are written to the sheet BEFORE descriptions
+ *     are fetched, so a description problem can never lose a lead.
+ *   - The description column has a fixed width with clipped text, and New
+ *     Leads rows are forced to one line high, so the tab stays neat however
+ *     long a description is. The cell holds the full text (up to 45,000
+ *     characters), which goes into the .xlsx / CRM import.
+ *
+ * CHANGES FROM v20 (carried forward):
+ *   - List changes now apply to rows ALREADY in the sheet, not just to new
+ *     jobs. At the start of every processJobAlerts() run (and on demand via
+ *     applyListsNow()), applyListChanges() re-checks existing rows:
+ *       - Company Blocklist / Job Title Blocklist: matching rows in New
+ *         Leads, Other and Needs Review move to Filtered Out.
+ *       - Unfilter Company: rows in Filtered Out that the AI filtered (not
+ *         the blocklists) move out. Filtered Out stores no region, so one
+ *         batched AI call places their towns; they then route as normal
+ *         (New Leads + Staff ID, or Other / Needs Review). If that AI call
+ *         fails, they stay put and are retried next run.
+ *       - Company Regions: matching rows in Other move to New Leads with
+ *         that region's Staff ID. Rows already in New Leads are left alone.
+ *   - Moved rows leave their old tab — each job is in exactly one tab. This
+ *     replaces v20's "rescued job skips the Filtered Out dedup and keeps
+ *     its old row" behaviour.
+ *   - Removing an entry from a list does NOT move rows back; it only stops
+ *     future jobs being affected.
+ *   - The region rules in the prompt are now one shared REGION_RULES block,
+ *     used by both the job-extraction prompt and the new region lookup.
  */
 
 const CONFIG = {
@@ -111,12 +127,13 @@ const REGION_TO_STAFF_ID = {
 
 // ---- Headers ------------------------------------------------------------------
 // TAB_HEADERS is still used by Other. New Leads has its own header list with
-// Job Description and Staff ID after Link, so Date Found (E) and Link (F)
-// stay put.
+// Staff ID (G) and Job Description (H) appended at the end, so Date Found (E)
+// and Link (F) stay put. New Leads feeds the CRM import: new columns go at
+// the end, never in between.
 const TAB_HEADERS = ['Source', 'Job Title', 'Company', 'Town', 'Date Found', 'Link'];
-const NEW_LEADS_HEADERS = [...TAB_HEADERS, 'Job Description', 'Staff ID'];
-const NL_DESCRIPTION = 6; // 0-based index of Job Description (column G)
-const NL_STAFF_ID = 7;    // 0-based index of Staff ID (column H)
+const NEW_LEADS_HEADERS = [...TAB_HEADERS, 'Staff ID', 'Job Description'];
+const NL_STAFF_ID = 6;    // 0-based index of Staff ID (column G)
+const NL_DESCRIPTION = 7; // 0-based index of Job Description (column H)
 const REVIEW_HEADERS = ['Source', 'Job Title', 'Company', 'Town', 'Date Found', 'Link', 'Reason'];
 const FILTERED_HEADERS = ['Source', 'Job Title', 'Company', 'Town', 'Date Found', 'Link', 'Filtered Reason'];
 const BLOCKLIST_HEADERS = ['Company'];
@@ -135,29 +152,23 @@ const REASON_COMPANY_BLOCKLIST = 'Company on blocklist';
 const REASON_TITLE_BLOCKLIST = 'Job title on blocklist';
 const REASON_UNFILTER_NO_REGION = 'Unfilter Company, but AI gave no usable region';
 
-// ---- Job descriptions ---------------------------------------------------------
+// ---- Job descriptions (New Leads column H) ------------------------------------
 const DESCRIPTION_CONFIG = {
-  MAX_CHARS: 45000,     // a Sheets cell holds 50,000 characters at most
-  FILL_DAYS: 7,         // fill leads found in the last 7 days...
-  START_DATE: new Date('2026-10-03T00:00:00+01:00'), // ...but never ones found before 3 Oct 2026
-  LINKEDIN_BATCH_SIZE: 5, // LinkedIn pages downloaded in parallel per batch
+  MAX_CHARS: 45000,          // a Sheets cell holds 50,000 characters at most
+  LINKEDIN_BATCH_SIZE: 5,    // LinkedIn pages downloaded in parallel per batch
   APIFY_ACTOR: 'misceres~indeed-scraper',
   APIFY_API: 'https://api.apify.com/v2',
-  APIFY_STALE_HOURS: 12,  // give up on an Apify run still unfinished after this long
-  SEND_WAIT_SECONDS: 180  // longest the 08:30 send waits for an unfinished Apify run
+  COLUMN_WIDTH_PX: 300,      // fixed width of the description column
+  ROW_HEIGHT_PX: 21          // Sheets' default single-line row height
 };
-const DESCRIPTION_PENDING = 'PENDING (Indeed description requested from Apify)';
 const DESCRIPTION_FAILED = 'FETCH FAILED';
+const DESCRIPTION_SPONSORED = 'No description (sponsored Indeed ad)';
 // Apify output field names vary between scraper versions; the first present wins.
 const APIFY_DESCRIPTION_FIELDS = ['description', 'descriptionText', 'jobDescription', 'descriptionHTML', 'descriptionHtml'];
-const APIFY_RUNS_KEY = 'APIFY_PENDING_RUNS';
-const PROCESSED_MESSAGES_KEY = 'PROCESSED_MESSAGE_IDS';
-const DAY_MS = 24 * 60 * 60 * 1000;
 
-// Apps Script kills a run at 6 minutes. Each entry point resets the clock;
-// work that can wait for the next run stops being started past these marks.
+// Apps Script stops a run at 6 minutes. Description work only uses the time
+// left before RUN_TIME_BUDGET_MS, so the run always finishes cleanly.
 const RUN_TIME_BUDGET_MS = 5 * 60 * 1000;
-const EMAIL_TIME_BUDGET_MS = 3.5 * 60 * 1000;
 let runStartedAt = Date.now();
 function timeLeftMs() { return RUN_TIME_BUDGET_MS - (Date.now() - runStartedAt); }
 
@@ -178,15 +189,11 @@ function processJobAlerts() {
 
   const sheets = openWorkingSheets(ss);
   const { tabSheets, reviewSheet, filteredSheet } = sheets;
-  const newLeadsSheet = tabSheets[CONFIG.NEW_LEADS_SHEET_NAME];
-  // Before anything appends to New Leads, so every row uses the same layout.
-  ensureNewLeadsLayout(newLeadsSheet);
   const lists = loadOverrideLists(ss);
   const { unfilterCompanies, companyRegionOverrides } = lists;
 
   // Runs before the dedup sets are loaded, so they reflect where rows ended up.
   applyListChanges(sheets, lists);
-  runDescriptionStep(() => collectApifyRuns(newLeadsSheet, 0));
 
   const existingLinksByTab = {};
   const existingKeysByTab = {};
@@ -205,28 +212,24 @@ function processJobAlerts() {
   ALL_TAB_NAMES.forEach(tabName => { newRowsByTab[tabName] = []; });
   const touchedTabs = new Set();
 
-  let addedCount = 0, filteredCount = 0, reviewCount = 0, skippedEmails = 0, blockedCount = 0, blockedTitleCount = 0, companyRegionOverrideCount = 0, unfilteredCount = 0, deferredEmails = 0;
+  // Indeed scraper runs started during the email loop (see startIndeedDescriptions()).
+  const indeedRuns = [];
 
-  // An email is only marked processed once all its jobs are handled, so one
-  // that fails (AI error) or is left for time is picked up next run.
-  const processed = loadProcessedMessages();
+  let addedCount = 0, filteredCount = 0, reviewCount = 0, skippedEmails = 0, blockedCount = 0, blockedTitleCount = 0, companyRegionOverrideCount = 0, unfilteredCount = 0;
 
   threads.forEach(thread => {
     thread.getMessages().forEach(msg => {
-      const msgId = msg.getId();
-      if (processed[msgId]) return;
-      if (Date.now() - runStartedAt > EMAIL_TIME_BUDGET_MS) { deferredEmails++; return; }
-
       const html = msg.getBody();
       const dateFound = msg.getDate();
       const source = detectSource(html);
-      if (!source) { processed[msgId] = Date.now(); return; }
+      if (!source) return;
 
       const { text: emailText, linkMap } = prepareEmailForApi(html);
-      if (!emailText || emailText.length < 20) { processed[msgId] = Date.now(); return; } // nothing worth sending
+      if (!emailText || emailText.length < 20) return; // nothing worth sending
 
       const jobs = callClaudeForJobs(emailText, source);
       if (jobs === null) { skippedEmails++; return; } // API/parse failure — already logged
+      const newLeadsBefore = newRowsByTab[CONFIG.NEW_LEADS_SHEET_NAME].length;
 
       jobs.forEach(job => {
         if (!job || !job.title || !job.company || !job.action) return;
@@ -311,22 +314,25 @@ function processJobAlerts() {
           if (link) linkSet.add(link);
           keySet.add(jobKey);
           const row = [source, job.title, job.company, town, dateFound, link];
-          // Job Description starts blank; fillJobDescriptions() fills it below.
-          if (tabName === CONFIG.NEW_LEADS_SHEET_NAME) row.push('', REGION_TO_STAFF_ID[region]);
+          if (tabName === CONFIG.NEW_LEADS_SHEET_NAME) row.push(REGION_TO_STAFF_ID[region], ''); // description filled after the rebuild
           newRowsByTab[tabName].push(row);
           touchedTabs.add(tabName);
           addedCount++;
         });
       });
-      processed[msgId] = Date.now();
+
+      // Start Apify for this email's new Indeed leads now, so it works while
+      // the remaining emails go through the AI.
+      if (source === 'Indeed') {
+        const newLinks = newRowsByTab[CONFIG.NEW_LEADS_SHEET_NAME].slice(newLeadsBefore).map(r => r[5]);
+        runDescriptionStep('starting Indeed descriptions', () => startIndeedDescriptions(newLinks, indeedRuns));
+      }
     });
   });
 
   REBUILD_TABS.forEach(tabName => {
     rebuildNewLeadsTab(tabSheets[tabName], newRowsByTab[tabName]);
   });
-
-  runDescriptionStep(() => fillJobDescriptions(newLeadsSheet, true));
 
   FLAT_TABS.forEach(tabName => {
     const sheet = tabSheets[tabName];
@@ -344,47 +350,15 @@ function processJobAlerts() {
     autoResizeSheet(sheet);
   });
 
-  saveProcessedMessages(processed);
-
-  // Read by runDailySend() to warn if the morning run didn't complete.
+  // Read by runDailySend() to warn if the morning run didn't complete. Set
+  // before descriptions: the leads are saved, and description problems
+  // are caught and logged, never treated as a failed run.
   PropertiesService.getScriptProperties().setProperty(LAST_PROCESSING_SUCCESS_KEY, todayInSendTimeZone());
 
-  Logger.log(`Done. ${addedCount} rows written (${companyRegionOverrideCount} redirected from Other via Company Regions, ${unfilteredCount} unfiltered via Unfilter Company). ${reviewCount} sent to Needs Review. ${filteredCount} filtered out (${blockedCount} due to Company Blocklist, ${blockedTitleCount} due to Job Title Blocklist). ${skippedEmails} email(s) skipped due to API/parse errors (retried next run).`
-    + (deferredEmails ? ` ${deferredEmails} email(s) left for the next run to stay inside the time limit.` : ''));
-}
+  const newLeadLinks = newRowsByTab[CONFIG.NEW_LEADS_SHEET_NAME].map(r => r[5]);
+  runDescriptionStep('filling job descriptions', () => fillJobDescriptions(tabSheets[CONFIG.NEW_LEADS_SHEET_NAME], newLeadLinks, indeedRuns));
 
-// Emails already handled, as { messageId: timestampHandled }. Entries older
-// than the Gmail lookback (plus margin) are dropped, since those emails no
-// longer come back from the search anyway.
-function loadProcessedMessages() {
-  const raw = PropertiesService.getScriptProperties().getProperty(PROCESSED_MESSAGES_KEY);
-  const all = raw ? JSON.parse(raw) : {};
-  const cutoff = Date.now() - (CONFIG.LOOKBACK_DAYS + 2) * DAY_MS;
-  const kept = {};
-  Object.keys(all).forEach(id => { if (all[id] >= cutoff) kept[id] = all[id]; });
-  return kept;
-}
-
-function saveProcessedMessages(processed) {
-  // A Script Property holds ~9KB. If there are ever too many emails to fit,
-  // forget the oldest — worst case those get re-read, and dedup catches them.
-  const ids = Object.keys(processed).sort((a, b) => processed[b] - processed[a]);
-  let json = JSON.stringify(processed);
-  while (json.length > 8500 && ids.length) {
-    delete processed[ids.pop()];
-    json = JSON.stringify(processed);
-  }
-  PropertiesService.getScriptProperties().setProperty(PROCESSED_MESSAGES_KEY, json);
-}
-
-// Descriptions are extra information, never worth failing the main job or
-// the daily email over: a failure here is logged and the rows are retried.
-function runDescriptionStep(fn) {
-  try {
-    fn();
-  } catch (err) {
-    Logger.log(`Job description step failed — affected rows are retried on the next run: ${err}`);
-  }
+  Logger.log(`Done. ${addedCount} rows written (${companyRegionOverrideCount} redirected from Other via Company Regions, ${unfilteredCount} unfiltered via Unfilter Company). ${reviewCount} sent to Needs Review. ${filteredCount} filtered out (${blockedCount} due to Company Blocklist, ${blockedTitleCount} due to Job Title Blocklist). ${skippedEmails} email(s) skipped due to API/parse errors.`);
 }
 
 // ==========================================================================
@@ -452,8 +426,7 @@ function applyListChanges(sheets, lists) {
   const other = sheets.tabSheets[CONFIG.OTHER_SHEET_NAME];
   const review = sheets.reviewSheet;
   const filtered = sheets.filteredSheet;
-  // Job Description starts blank; fillJobDescriptions() fills it if recent.
-  const toNewLeads = (r, region) => newLeads.appendRow([...r.slice(0, 6), '', REGION_TO_STAFF_ID[region]]);
+  const toNewLeads = (r, region) => newLeads.appendRow([...r.slice(0, 6), REGION_TO_STAFF_ID[region]]);
 
   // 1. Blocklists
   let blocked = 0;
@@ -503,19 +476,10 @@ function applyListChanges(sheets, lists) {
 // Run by hand after editing a list to apply it straight away, without
 // waiting for the next daily run. Doesn't fetch any new emails.
 function applyListsNow() {
-  runStartedAt = Date.now();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheets = openWorkingSheets(ss);
-  const newLeadsSheet = sheets.tabSheets[CONFIG.NEW_LEADS_SHEET_NAME];
-  ensureNewLeadsLayout(newLeadsSheet);
   applyListChanges(sheets, loadOverrideLists(ss));
   REBUILD_TABS.forEach(tabName => rebuildNewLeadsTab(sheets.tabSheets[tabName], []));
-  // Rows just moved into New Leads get their description now (LinkedIn) or
-  // on the next collect (Indeed).
-  runDescriptionStep(() => {
-    collectApifyRuns(newLeadsSheet, 0);
-    fillJobDescriptions(newLeadsSheet, false);
-  });
   [...FLAT_TABS.map(t => sheets.tabSheets[t]), sheets.reviewSheet, sheets.filteredSheet].forEach(sheet => {
     formatDateColumn(sheet);
     sortNewestFirst(sheet);
@@ -540,7 +504,7 @@ function takeRows(sheet, predicate) {
   const kept = rows.filter(r => !predicate(r));
   const numCols = rows[0].length;
   sheet.getRange(2, 1, rows.length, numCols).clearContent();
-  if (kept.length > 0) sheet.getRange(2, 1, kept.length, numCols).setValues(kept);
+  if (kept.length > 0) sheet.getRange(2, 1, kept.length, numCols).setValues(kept.map(r => r.map(safeCellText)));
   return taken;
 }
 
@@ -755,10 +719,9 @@ ${listings}`);
 // ==========================================================================
 // Full read-clear-rewrite: reads back existing rows, merges in this run's
 // new rows, dedupes by Link, sorts newest-first and rewrites the tab. Job
-// rows with no Link are intentionally dropped. Every row is written in the
-// current 8-column layout (NEW_LEADS_HEADERS). Older layouts are converted
-// on read-back: v19–v21 had Staff ID in G and no Job Description; pre-v19
-// rows had neither, so both stay blank.
+// rows with no Link are intentionally dropped. Every row is written with
+// NEW_LEADS_HEADERS' 8 columns; older rows read back with a blank Staff ID
+// (before v19) or Job Description (before v24) and keep it.
 
 function rebuildNewLeadsTab(sheet, newRows) {
   if (!sheet) {
@@ -772,14 +735,12 @@ function rebuildNewLeadsTab(sheet, newRows) {
   const existingRows = [];
   if (lastRow >= 1) {
     const data = sheet.getRange(1, 1, lastRow, numCols).getValues();
-    const staffIdInG = data[0][NL_DESCRIPTION] === 'Staff ID'; // v19–v21 header
     data.forEach(row => {
-      // Compares only the first 6 cells so older headers (fewer or
-      // differently ordered columns after F) are recognised too, rather than
-      // being carried forward as a job row.
+      // Compares only the first 6 cells so the pre-v19 header (no Staff ID)
+      // is recognised too, rather than being carried forward as a job row.
       const isHeaderRow = row.slice(0, TAB_HEADERS.length).join('|') === TAB_HEADERS.join('|');
       if (isHeaderRow || !row[5]) return;
-      existingRows.push(staffIdInG ? [...row.slice(0, 6), '', row[NL_DESCRIPTION]] : row);
+      existingRows.push(row);
     });
   }
 
@@ -792,9 +753,6 @@ function rebuildNewLeadsTab(sheet, newRows) {
     return true;
   });
   combined.sort((a, b) => new Date(b[4]) - new Date(a[4]));
-  // Read-back drops the apostrophe that keeps a description like "=..." from
-  // becoming a formula, so it has to be re-applied on every rewrite.
-  combined.forEach(row => { row[NL_DESCRIPTION] = safeCellText(row[NL_DESCRIPTION]); });
 
   sheet.clear();
 
@@ -802,31 +760,23 @@ function rebuildNewLeadsTab(sheet, newRows) {
 
   if (combined.length > 0) {
     const dataStartRow = 2;
-    sheet.getRange(dataStartRow, 1, combined.length, numCols).setValues(combined);
+    // Reading back drops the apostrophe that keeps formula-like text as text, so it's re-applied.
+    sheet.getRange(dataStartRow, 1, combined.length, numCols).setValues(combined.map(r => r.map(safeCellText)));
     sheet.getRange(dataStartRow, 5, combined.length, 1).setNumberFormat('dd/mm/yyyy hh:mm');
-    // Sheets grows a row to show every line of a multi-line cell, whatever
-    // the wrap setting, so descriptions would make rows very tall. Forcing the
-    // height keeps every lead on one line; the full text is still in the cell.
-    sheet.setRowHeightsForced(dataStartRow, combined.length, NEW_LEADS_ROW_HEIGHT_PX);
   }
-
-  // Auto-sizing the description column would stretch it to the longest
-  // description, so it gets a fixed width and clipped text instead.
-  sheet.autoResizeColumns(1, TAB_HEADERS.length);
-  sheet.autoResizeColumns(NL_STAFF_ID + 1, 1);
-  applyFixedLinkColumnWidth(sheet);
-  sheet.setColumnWidth(NL_DESCRIPTION + 1, DESCRIPTION_COLUMN_WIDTH_PX);
-  sheet.getRange(1, NL_DESCRIPTION + 1, sheet.getMaxRows(), 1).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+  formatNewLeadsLayout(sheet);
 }
 
-const DESCRIPTION_COLUMN_WIDTH_PX = 300;
-const NEW_LEADS_ROW_HEIGHT_PX = 21; // Sheets' default single-line row height
-
-// New Leads in an older layout (Staff ID in G) is converted before anything
-// appends rows to it, so new and old rows never end up mixed.
-function ensureNewLeadsLayout(sheet) {
-  const header = sheet.getRange(1, 1, 1, NEW_LEADS_HEADERS.length).getValues()[0];
-  if (header.join('|') !== NEW_LEADS_HEADERS.join('|')) rebuildNewLeadsTab(sheet, []);
+// Keeps New Leads neat whatever is in the description column: A–G sized to
+// fit, Link (F) and Job Description (H) at a fixed width with clipped text,
+// and every row one line high. (Sheets grows a row to show every line of a
+// multi-line cell regardless of the wrap setting, so the height is forced.)
+function formatNewLeadsLayout(sheet) {
+  sheet.autoResizeColumns(1, NL_STAFF_ID + 1);
+  applyFixedLinkColumnWidth(sheet);
+  sheet.setColumnWidth(NL_DESCRIPTION + 1, DESCRIPTION_CONFIG.COLUMN_WIDTH_PX);
+  sheet.getRange(1, NL_DESCRIPTION + 1, sheet.getMaxRows(), 1).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+  if (sheet.getLastRow() >= 2) sheet.setRowHeightsForced(2, sheet.getLastRow() - 1, DESCRIPTION_CONFIG.ROW_HEIGHT_PX);
 }
 
 // A string starting with = + - or @ would be read by Sheets as a formula; the
@@ -838,20 +788,28 @@ function safeCellText(value) {
 // ==========================================================================
 // JOB DESCRIPTIONS — downloaded, never written by the AI
 // ==========================================================================
-// LinkedIn: the public guest job page has the full description; fetched
-//   directly, several at a time.
-// Indeed: blocks Apps Script (401/403), so one Apify scraper run per batch.
-//   Apify takes 1–3 minutes, so a run is started and its jobs marked PENDING;
-//   collectApifyRuns() fills them in later (start of the next 07:30 run, and
-//   before the 08:30 send, which waits for it if needed). Started runs are
-//   remembered in Script Properties (APIFY_RUNS_KEY).
-// Anything that can't be retrieved says "FETCH FAILED (reason)". Only leads
-// inside the fill window (inDescriptionWindow()) are ever fetched.
+// For the rows a run adds to New Leads from the emails, in that same run:
+// - LinkedIn: the public guest job page has the full description; fetched
+//   directly, several at a time. (Claude's own web fetch is blocked by
+//   LinkedIn, so it isn't used.)
+// - Indeed, ordinary jobs (job ID "jk" in the link): Indeed blocks Apps
+//   Script, so Apify's Indeed scraper fetches them. One scraper run per
+//   Indeed email is started during the email loop (startIndeedDescriptions())
+//   and collected at the end (fillJobDescriptions()), so the 1–3 minutes it
+//   takes overlap with the rest of the run.
+// - Indeed, sponsored jobs (pagead ad links, no job ID): not fetched — the
+//   scraper rejects ad links. The cell says DESCRIPTION_SPONSORED.
+// Anything that can't be retrieved says "FETCH FAILED (reason)", never a
+// guess. Rows moved into New Leads by applyListChanges() aren't fetched.
 
-function inDescriptionWindow(dateFound) {
-  return dateFound instanceof Date
-    && dateFound >= DESCRIPTION_CONFIG.START_DATE
-    && Date.now() - dateFound.getTime() <= DESCRIPTION_CONFIG.FILL_DAYS * DAY_MS;
+// Runs a description step so that any failure is logged and can never stop
+// processJobAlerts() — the leads themselves are already saved.
+function runDescriptionStep(label, fn) {
+  try {
+    fn();
+  } catch (err) {
+    Logger.log(`Job descriptions: error while ${label} (leads are unaffected): ${err && err.stack ? err.stack : err}`);
+  }
 }
 
 function linkedInJobId(link) {
@@ -862,69 +820,94 @@ function linkedInJobId(link) {
 function indeedJobKey(link) {
   const s = String(link || '');
   if (!/indeed\.com/i.test(s)) return null;
-  const m = s.match(/[?&]jk=([^&#]+)/);
+  const m = s.match(/[?&]v?jk=([^&#]+)/);
   return m ? m[1] : null;
 }
 
-// Fills the Job Description cell of New Leads rows inside the fill window
-// that are blank — or, with retryFailed, say FETCH FAILED — plus any PENDING
-// row whose Apify run is no longer being tracked. LinkedIn rows are fetched
-// now; Indeed rows go into one new Apify run and are marked PENDING.
-function fillJobDescriptions(sheet, retryFailed) {
-  const rows = readRows(sheet);
-  const trackedJks = new Set(loadApifyRuns().flatMap(run => run.jks));
-  const updates = new Map(); // row index -> new cell text
-  const linkedIn = [];
-  const indeedRowsByJk = new Map();
-
-  rows.forEach((row, i) => {
-    if (!inDescriptionWindow(row[4])) return;
-    const current = String(row[NL_DESCRIPTION] || '');
-    const jk = indeedJobKey(row[5]);
-    const needed = current === ''
-      || (retryFailed && current.startsWith(DESCRIPTION_FAILED))
-      || (current === DESCRIPTION_PENDING && !trackedJks.has(jk));
-    if (!needed) return;
-
-    if (linkedInJobId(row[5])) {
-      linkedIn.push(i);
-    } else if (jk) {
-      if (trackedJks.has(jk)) { updates.set(i, DESCRIPTION_PENDING); return; } // already in a running Apify run
-      if (!indeedRowsByJk.has(jk)) indeedRowsByJk.set(jk, []);
-      indeedRowsByJk.get(jk).push(i);
-    } else if (/indeed\.com/i.test(String(row[5]))) {
-      updates.set(i, `${DESCRIPTION_FAILED} (Indeed link has no job ID)`);
-    } else {
-      updates.set(i, `${DESCRIPTION_FAILED} (no LinkedIn or Indeed job link)`);
-    }
-  });
-
-  // LinkedIn in parallel batches. Rows left over when time runs short stay
-  // blank and are fetched by the next run.
-  const batchSize = DESCRIPTION_CONFIG.LINKEDIN_BATCH_SIZE;
-  for (let b = 0; b < linkedIn.length; b += batchSize) {
-    if (timeLeftMs() < 60 * 1000) {
-      Logger.log(`${linkedIn.length - b} LinkedIn description(s) left for the next run to stay inside the time limit.`);
-      break;
-    }
-    const batch = linkedIn.slice(b, b + batchSize);
-    const texts = fetchLinkedInDescriptions(batch.map(i => rows[i][5]));
-    batch.forEach((i, k) => updates.set(i, texts[k]));
-  }
-
-  if (indeedRowsByJk.size > 0) {
-    const started = startApifyRun([...indeedRowsByJk.keys()]);
-    const text = started.error ? `${DESCRIPTION_FAILED} (${started.error})` : DESCRIPTION_PENDING;
-    indeedRowsByJk.forEach(indexes => indexes.forEach(i => updates.set(i, text)));
-  }
-
-  writeDescriptions(sheet, updates);
+function indeedViewUrl(jk) {
+  return `https://uk.indeed.com/viewjob?jk=${jk}`;
 }
 
-function writeDescriptions(sheet, updates) {
-  updates.forEach((text, i) => {
-    sheet.getRange(i + 2, NL_DESCRIPTION + 1).setValue(safeCellText(text));
+// Starts one Apify Indeed scraper run for these new leads' ordinary Indeed
+// jobs and adds it to `indeedRuns` (or adds the reason it couldn't start).
+function startIndeedDescriptions(links, indeedRuns) {
+  const jks = [...new Set(links.map(indeedJobKey).filter(Boolean))];
+  if (jks.length === 0) return;
+  const token = PropertiesService.getScriptProperties().getProperty('APIFY_TOKEN');
+  if (!token) { indeedRuns.push({ jks: jks, error: 'APIFY_TOKEN not set in Script Properties' }); return; }
+  const secondsLeft = Math.floor(timeLeftMs() / 1000);
+  if (secondsLeft < 90) { indeedRuns.push({ jks: jks, error: 'not enough time left in this run to ask Apify' }); return; }
+
+  // Apify's own timeout stops (and stops charging for) the run if this script can't wait for it.
+  const res = apifyRequest(token, 'post', `/acts/${DESCRIPTION_CONFIG.APIFY_ACTOR}/runs?timeout=${secondsLeft}`, {
+    startUrls: jks.map(jk => ({ url: indeedViewUrl(jk) })),
+    maxItems: jks.length
   });
+  if (res.error) { indeedRuns.push({ jks: jks, error: res.error }); return; }
+  indeedRuns.push({ jks: jks, runId: res.data.id, datasetId: res.data.defaultDatasetId });
+  Logger.log(`Apify run ${res.data.id} started for ${jks.length} Indeed job(s).`);
+}
+
+// Fetches and writes the descriptions for this run's new New Leads rows
+// (identified by Link), collecting the Indeed runs started earlier.
+function fillJobDescriptions(sheet, newLinks, indeedRuns) {
+  if (newLinks.length === 0) return;
+  const results = new Map(); // link -> cell text
+  const linkedIn = [];
+  newLinks.forEach(link => {
+    if (linkedInJobId(link)) linkedIn.push(link);
+    else if (indeedJobKey(link)) return; // from Apify, below
+    else if (/indeed\.com/i.test(String(link))) results.set(link, DESCRIPTION_SPONSORED);
+    else results.set(link, `${DESCRIPTION_FAILED} (no LinkedIn or Indeed job link)`);
+  });
+
+  // LinkedIn, a few pages at a time, while there's time left.
+  for (let i = 0; i < linkedIn.length; i += DESCRIPTION_CONFIG.LINKEDIN_BATCH_SIZE) {
+    const batch = linkedIn.slice(i, i + DESCRIPTION_CONFIG.LINKEDIN_BATCH_SIZE);
+    if (timeLeftMs() < 60 * 1000) {
+      batch.forEach(link => results.set(link, `${DESCRIPTION_FAILED} (run out of time)`));
+      continue;
+    }
+    fetchLinkedInDescriptions(batch).forEach((text, k) => results.set(batch[k], text));
+  }
+
+  // Indeed: wait for the Apify runs, leaving 30s to write everything.
+  const token = PropertiesService.getScriptProperties().getProperty('APIFY_TOKEN');
+  const deadline = Date.now() + Math.max(0, timeLeftMs() - 30 * 1000);
+  const indeedTexts = new Map(); // jk -> cell text
+  indeedRuns.forEach(run => {
+    const texts = run.error
+      ? new Map(run.jks.map(jk => [jk, `${DESCRIPTION_FAILED} (Indeed: ${run.error})`]))
+      : collectIndeedRun(token, run, deadline);
+    texts.forEach((text, jk) => indeedTexts.set(jk, text));
+  });
+  newLinks.forEach(link => {
+    const jk = indeedJobKey(link);
+    if (jk) results.set(link, indeedTexts.get(jk) || `${DESCRIPTION_FAILED} (Indeed: not sent to Apify — see logs)`);
+  });
+
+  writeDescriptions(sheet, results);
+
+  const texts = [...results.values()];
+  const failed = texts.filter(t => String(t).startsWith(DESCRIPTION_FAILED)).length;
+  const sponsored = texts.filter(t => t === DESCRIPTION_SPONSORED).length;
+  Logger.log(`Job descriptions: ${texts.length - failed - sponsored} filled, ${sponsored} sponsored Indeed (skipped), ${failed} FETCH FAILED.`);
+}
+
+// Writes cell texts into New Leads column H for the rows with these links,
+// in one write. Only fills cells that are still blank.
+function writeDescriptions(sheet, results) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2 || results.size === 0) return;
+  const links = sheet.getRange(2, 6, lastRow - 1, 1).getValues();
+  const column = sheet.getRange(2, NL_DESCRIPTION + 1, lastRow - 1, 1).getValues();
+  let changed = false;
+  links.forEach((cell, i) => {
+    const text = results.get(cell[0]);
+    if (text !== undefined && column[i][0] === '') { column[i][0] = text; changed = true; }
+  });
+  if (changed) sheet.getRange(2, NL_DESCRIPTION + 1, lastRow - 1, 1).setValues(column.map(r => r.map(safeCellText)));
+  formatNewLeadsLayout(sheet);
 }
 
 // ---- LinkedIn ----
@@ -978,6 +961,83 @@ function divContents(html, marker) {
   return html.substring(start);
 }
 
+// ---- Indeed via Apify ----
+
+// Waits (until deadline) for an Apify run and returns Map(jk -> cell text).
+// A run still going at the deadline is aborted, so it isn't charged further.
+function collectIndeedRun(token, run, deadline) {
+  const failAll = reason => new Map(run.jks.map(jk => [jk, `${DESCRIPTION_FAILED} (Indeed: ${reason})`]));
+  let status = 'RUNNING';
+  while (status === 'READY' || status === 'RUNNING') {
+    const wait = Math.floor((deadline - Date.now()) / 1000);
+    if (wait <= 0) break;
+    // waitForFinish holds the request open until the run ends (max 45s, inside UrlFetchApp's limit).
+    const poll = apifyRequest(token, 'get', `/actor-runs/${run.runId}?waitForFinish=${Math.min(45, wait)}`);
+    if (poll.error) return failAll(poll.error);
+    status = poll.data.status;
+  }
+  if (status === 'READY' || status === 'RUNNING') {
+    apifyRequest(token, 'post', `/actor-runs/${run.runId}/abort`);
+    Logger.log(`Apify run ${run.runId} didn't finish in time and was stopped.`);
+    return failAll('Apify didn\'t finish within this run\'s time limit');
+  }
+
+  // A failed or timed-out run may still have scraped some jobs, so read what's there.
+  const res = apifyRequest(token, 'get', `/datasets/${run.datasetId}/items?clean=true&format=json`);
+  if (res.error) return failAll(res.error);
+  const items = Array.isArray(res.data) ? res.data : [];
+  Logger.log(`Apify run ${run.runId} ${status}: ${items.length} result(s) for ${run.jks.length} job(s).`
+    + (items.length ? ` Fields in first result: ${Object.keys(items[0]).join(', ')}` : ''));
+  const runNote = status === 'SUCCEEDED' ? '' : `; Apify run ${status}`;
+
+  return new Map(run.jks.map(jk => {
+    // The field holding the job ID varies, so match on the whole result.
+    const item = items.find(it => JSON.stringify(it).indexOf(jk) !== -1);
+    if (!item) return [jk, `${DESCRIPTION_FAILED} (Indeed: Apify returned no result for this job${runNote})`];
+    const field = APIFY_DESCRIPTION_FIELDS.find(name => item[name]);
+    if (!field) return [jk, `${DESCRIPTION_FAILED} (Indeed: Apify's result had no description)`];
+    const value = item[field];
+    const html = typeof value === 'object' ? (value.html || value.text || JSON.stringify(value)) : value;
+    return [jk, finishDescription(descriptionHtmlToText(html), 'Indeed')];
+  }));
+}
+
+// Calls the Apify API. Returns { data } or { error } with Apify's own
+// message (full reply logged). Run endpoints wrap their payload in { data };
+// dataset items are a bare array.
+function apifyRequest(token, method, path, payload) {
+  const options = { method: method, headers: { Authorization: `Bearer ${token}` }, muteHttpExceptions: true };
+  if (payload) {
+    options.contentType = 'application/json';
+    options.payload = JSON.stringify(payload);
+  }
+  let response;
+  try {
+    response = UrlFetchApp.fetch(DESCRIPTION_CONFIG.APIFY_API + path, options);
+  } catch (err) {
+    Logger.log(`Apify request failed (${path}): ${err}`);
+    return { error: `Apify request failed: ${String(err).substring(0, 150)}` };
+  }
+  const code = response.getResponseCode();
+  const body = response.getContentText();
+  if (code < 200 || code >= 300) {
+    // 401 = bad token; 402/403 usually = out of credit or a permissions problem.
+    Logger.log(`Apify returned status ${code} for ${path}: ${body.substring(0, 500)}`);
+    let message = body;
+    try { message = JSON.parse(body).error.message || body; } catch (e) { /* keep the raw reply */ }
+    return { error: `Apify returned status ${code}: ${String(message).substring(0, 150)}` };
+  }
+  try {
+    const parsed = JSON.parse(body);
+    return { data: Array.isArray(parsed) ? parsed : parsed.data };
+  } catch (err) {
+    Logger.log(`Couldn't read Apify response for ${path}: ${err}`);
+    return { error: 'unreadable reply from Apify — see logs' };
+  }
+}
+
+// ---- Shared ----
+
 // HTML to readable text, keeping bullets and line breaks. Plain-text input
 // (some Apify results) passes through apart from tidying.
 function descriptionHtmlToText(html) {
@@ -1003,209 +1063,6 @@ function finishDescription(text, site) {
   if (text.length < 50) return `${DESCRIPTION_FAILED} (${site} description was empty)`;
   if (text.length > DESCRIPTION_CONFIG.MAX_CHARS) text = text.substring(0, DESCRIPTION_CONFIG.MAX_CHARS) + ' …(truncated)';
   return text;
-}
-
-// ---- Indeed via Apify ----
-
-function loadApifyRuns() {
-  const raw = PropertiesService.getScriptProperties().getProperty(APIFY_RUNS_KEY);
-  return raw ? JSON.parse(raw) : [];
-}
-
-function saveApifyRuns(runs) {
-  PropertiesService.getScriptProperties().setProperty(APIFY_RUNS_KEY, JSON.stringify(runs));
-}
-
-function indeedViewUrl(jk) {
-  return `https://uk.indeed.com/viewjob?jk=${jk}`;
-}
-
-// Starts one scraper run for all the given Indeed job IDs and remembers it.
-// Returns {} or { error }.
-function startApifyRun(jks) {
-  const token = PropertiesService.getScriptProperties().getProperty('APIFY_TOKEN');
-  if (!token) return { error: 'APIFY_TOKEN not set in Script Properties' };
-  const res = apifyRequest(token, 'post', `/acts/${DESCRIPTION_CONFIG.APIFY_ACTOR}/runs`, {
-    startUrls: jks.map(jk => ({ url: indeedViewUrl(jk) })),
-    maxItems: jks.length
-  });
-  if (res.error) return res;
-  const runs = loadApifyRuns();
-  runs.push({ runId: res.data.id, datasetId: res.data.defaultDatasetId, jks: jks, startedAt: Date.now() });
-  saveApifyRuns(runs);
-  Logger.log(`Apify run ${res.data.id} started for ${jks.length} Indeed job(s).`);
-  return {};
-}
-
-// Writes the results of every finished Apify run into the PENDING rows they
-// belong to. Waits up to maxWaitMs for runs still going; runs that are still
-// going after that stay tracked for the next collect.
-function collectApifyRuns(sheet, maxWaitMs) {
-  const runs = loadApifyRuns();
-  if (runs.length === 0) return;
-  const token = PropertiesService.getScriptProperties().getProperty('APIFY_TOKEN');
-  const deadline = Date.now() + Math.max(0, maxWaitMs);
-  const results = new Map(); // jk -> cell text
-  const stillRunning = [];
-  runs.forEach(run => {
-    const outcome = finishApifyRun(token, run, deadline);
-    if (outcome === null) stillRunning.push(run);
-    else outcome.forEach((text, jk) => results.set(jk, text));
-  });
-  saveApifyRuns(stillRunning);
-  if (results.size === 0) return;
-
-  const updates = new Map();
-  readRows(sheet).forEach((row, i) => {
-    const jk = indeedJobKey(row[5]);
-    if (row[NL_DESCRIPTION] === DESCRIPTION_PENDING && results.has(jk)) updates.set(i, results.get(jk));
-  });
-  writeDescriptions(sheet, updates);
-  Logger.log(`Apify results written for ${updates.size} Indeed lead(s)${stillRunning.length ? `; ${stillRunning.length} run(s) still going` : ''}.`);
-}
-
-// Returns Map(jk -> cell text) once the run has finished (or has to be given
-// up on), or null if it's still going and should be checked again later.
-function finishApifyRun(token, run, deadline) {
-  const failAll = reason => new Map(run.jks.map(jk => [jk, `${DESCRIPTION_FAILED} (${reason})`]));
-  if (!token) return failAll('APIFY_TOKEN not set in Script Properties');
-  const stale = Date.now() - run.startedAt > DESCRIPTION_CONFIG.APIFY_STALE_HOURS * 60 * 60 * 1000;
-
-  const res = apifyRunItems(token, run, deadline);
-  if (res === null) {
-    return stale ? failAll(`Apify run still unfinished after ${DESCRIPTION_CONFIG.APIFY_STALE_HOURS} hours`) : null;
-  }
-  if (res.error) return stale ? failAll(res.error) : null;
-  const status = res.status;
-  const list = res.items;
-  const runNote = status === 'SUCCEEDED' ? '' : `; Apify run ${status}`;
-  Logger.log(`Apify run ${run.runId} ${status}: ${list.length} result(s) for ${run.jks.length} job(s).`
-    + (list.length ? ` Fields in first result: ${Object.keys(list[0]).join(', ')}` : ''));
-
-  return new Map(run.jks.map(jk => {
-    // The field holding the job ID varies, so match on the whole result.
-    const item = list.find(it => JSON.stringify(it).indexOf(jk) !== -1);
-    if (!item) return [jk, `${DESCRIPTION_FAILED} (Apify returned no result for this job${runNote})`];
-    const field = APIFY_DESCRIPTION_FIELDS.find(name => item[name]);
-    if (!field) return [jk, `${DESCRIPTION_FAILED} (Apify result had no description)`];
-    const value = item[field];
-    const html = typeof value === 'object' ? (value.html || value.text || JSON.stringify(value)) : value;
-    return [jk, finishDescription(descriptionHtmlToText(html), 'Indeed')];
-  }));
-}
-
-// Waits (until deadline, within the run's time budget) for an Apify run to
-// finish, then reads its results. Returns { status, items }, { error }, or
-// null if it's still going.
-function apifyRunItems(token, run, deadline) {
-  const unfinished = s => s === 'READY' || s === 'RUNNING';
-  let status = 'RUNNING';
-  do {
-    // waitForFinish holds the request open (max 45s, inside UrlFetchApp's limit).
-    const wait = Math.max(0, Math.min(45, Math.floor((deadline - Date.now()) / 1000)));
-    const poll = apifyRequest(token, 'get', `/actor-runs/${run.runId}?waitForFinish=${wait}`);
-    if (poll.error) return { error: poll.error };
-    status = poll.data.status;
-  } while (unfinished(status) && Date.now() < deadline && timeLeftMs() > 60 * 1000);
-  if (unfinished(status)) return null;
-
-  // A failed or timed-out run may still have scraped some jobs, so read what's there.
-  const items = apifyRequest(token, 'get', `/datasets/${run.datasetId}/items?clean=true&format=json`);
-  if (items.error) return { error: items.error };
-  return { status: status, items: Array.isArray(items.data) ? items.data : [] };
-}
-
-// Calls the Apify API. Returns { data } or { error } (details logged).
-// Run endpoints wrap their payload in { data }, dataset items are a bare array.
-function apifyRequest(token, method, path, payload) {
-  const options = { method: method, headers: { Authorization: `Bearer ${token}` }, muteHttpExceptions: true };
-  if (payload) {
-    options.contentType = 'application/json';
-    options.payload = JSON.stringify(payload);
-  }
-  let response;
-  try {
-    response = UrlFetchApp.fetch(DESCRIPTION_CONFIG.APIFY_API + path, options);
-  } catch (err) {
-    Logger.log(`Apify request failed (${path}): ${err}`);
-    return { error: `Apify request failed: ${String(err).substring(0, 150)}` };
-  }
-  const code = response.getResponseCode();
-  const body = response.getContentText();
-  if (code < 200 || code >= 300) {
-    // 401 = bad token; 402/403 usually = out of credit, the scraper's free
-    // trial has ended, or it hasn't been added to the Apify account yet.
-    // Apify's own message goes into the cell so the cause is visible there.
-    Logger.log(`Apify returned status ${code} for ${path}: ${body.substring(0, 500)}`);
-    let message = '';
-    try { message = JSON.parse(body).error.message || ''; } catch (e) { message = body; }
-    return { error: `Apify returned status ${code}: ${String(message).substring(0, 150)}` };
-  }
-  try {
-    const parsed = JSON.parse(body);
-    return { data: Array.isArray(parsed) ? parsed : parsed.data };
-  } catch (err) {
-    Logger.log(`Couldn't read Apify response for ${path}: ${err}`);
-    return { error: 'Unreadable Apify response — see logs' };
-  }
-}
-
-// ---- Manual tools + email summary ----
-
-// Run by hand to fill descriptions straight away (e.g. the first time),
-// waiting for Apify where needed. Doesn't fetch new emails.
-function fillJobDescriptionsNow() {
-  runStartedAt = Date.now();
-  const sheet = getOrCreateSheet(SpreadsheetApp.getActiveSpreadsheet(), CONFIG.NEW_LEADS_SHEET_NAME);
-  ensureNewLeadsLayout(sheet);
-  collectApifyRuns(sheet, 0);
-  fillJobDescriptions(sheet, true);
-  collectApifyRuns(sheet, Math.min(DESCRIPTION_CONFIG.SEND_WAIT_SECONDS * 1000, timeLeftMs() - 30 * 1000));
-  Logger.log(descriptionStatusLine(sheet) || 'No leads inside the description window.');
-}
-
-// Dry run for the Apify route (not yet confirmed on a real run): sends up to
-// three Indeed leads from New Leads to Apify, logs what comes back, and
-// writes nothing to the sheet.
-function debugIndeedDescriptions() {
-  runStartedAt = Date.now();
-  const token = PropertiesService.getScriptProperties().getProperty('APIFY_TOKEN');
-  if (!token) { Logger.log('APIFY_TOKEN not set in Script Properties.'); return; }
-  const sheet = getOrCreateSheet(SpreadsheetApp.getActiveSpreadsheet(), CONFIG.NEW_LEADS_SHEET_NAME);
-  const jks = [...new Set(readRows(sheet).map(r => indeedJobKey(r[5])).filter(Boolean))].slice(0, 3);
-  if (!jks.length) { Logger.log('No Indeed leads with a job ID in New Leads.'); return; }
-
-  const start = apifyRequest(token, 'post', `/acts/${DESCRIPTION_CONFIG.APIFY_ACTOR}/runs`, {
-    startUrls: jks.map(jk => ({ url: indeedViewUrl(jk) })), maxItems: jks.length
-  });
-  if (start.error) { Logger.log(`Couldn't start Apify: ${start.error}`); return; }
-  const run = { runId: start.data.id, datasetId: start.data.defaultDatasetId, jks: jks, startedAt: Date.now() };
-  Logger.log(`Apify run ${run.runId} started for: ${jks.join(', ')}. Waiting...`);
-
-  const results = finishApifyRun(token, run, Date.now() + 240 * 1000);
-  if (results === null) { Logger.log(`Run ${run.runId} still going — check it in the Apify console.`); return; }
-  const items = apifyRequest(token, 'get', `/datasets/${run.datasetId}/items?clean=true&format=json`);
-  if (items.data && items.data.length) Logger.log(`Fields in first result: ${Object.keys(items.data[0]).join(', ')}`);
-  results.forEach((text, jk) => Logger.log(`${indeedViewUrl(jk)}\n  -> ${text.substring(0, 300)}`));
-}
-
-// One line for the daily email about leads inside the description window.
-function descriptionStatusLine(sheet) {
-  const recent = readRows(sheet).filter(r => inDescriptionWindow(r[4]));
-  if (!recent.length) return '';
-  let filled = 0, pending = 0, failed = 0, blank = 0;
-  recent.forEach(r => {
-    const d = String(r[NL_DESCRIPTION] || '');
-    if (d === '') blank++;
-    else if (d === DESCRIPTION_PENDING) pending++;
-    else if (d.startsWith(DESCRIPTION_FAILED)) failed++;
-    else filled++;
-  });
-  let line = `Job descriptions for leads from the last ${DESCRIPTION_CONFIG.FILL_DAYS} days: ${filled} of ${recent.length} filled`;
-  if (pending) line += `, ${pending} still pending from Indeed (filled on the next run)`;
-  if (failed) line += `, ${failed} couldn't be retrieved (marked FETCH FAILED)`;
-  if (blank) line += `, ${blank} not fetched yet`;
-  return line + '.';
 }
 
 // ==========================================================================
@@ -1333,7 +1190,7 @@ function debugListSheetNames() {
 // rebuilds New Leads as a flat, newest-first list via the same
 // rebuildNewLeadsTab() the daily run uses. Leaves the old tabs in place —
 // delete Craig/Alison/Tom/Josh/Ray manually once New Leads looks right.
-// Migrated rows get a blank Job Description and Staff ID, like any pre-v19 row.
+// Migrated rows get a blank Staff ID, same as any other pre-v19 row.
 
 const OLD_CONSULTANT_TAB_NAMES = ['Craig', 'Alison', 'Tom', 'Josh', 'Ray'];
 
@@ -1359,7 +1216,7 @@ function migrateConsultantTabsToNewLeads() {
       if (isHeaderRow || (restBlank && row[0])) return; // header or region heading row
       if (!row[5] || seenLinks.has(row[5])) return; // no link, or already pulled from another tab
       seenLinks.add(row[5]);
-      migratedRows.push([...row, '', '']);
+      migratedRows.push([...row, '', '']); // blank Staff ID and Job Description
     });
   });
 
@@ -1642,15 +1499,7 @@ function testParseLatestEmail() {
 // processJobAlerts() records the date of its last successful run in
 // Script Properties, and runDailySend() checks it.
 //
-// Job descriptions are split across the two runs to stay inside Apps
-// Script's 6-minute limit: the 07:30 run fills LinkedIn and starts Apify for
-// Indeed; runDailySend() collects the Indeed results (waiting up to
-// SEND_WAIT_SECONDS if needed) before it exports.
-//
 // SETUP (once, from the Apps Script editor):
-//   0. Project Settings > Script Properties: add APIFY_TOKEN (Apify >
-//      Settings > API & Integrations), and click "Try for free" on the
-//      misceres~indeed-scraper page in Apify.
 //   1. Run processJobAlerts(), then runDailySend(). The first run asks for
 //      permission to send email; check the email arrives with today's data.
 //   2. Run createDailyTriggers(). It deletes any existing schedule triggers
@@ -1679,33 +1528,14 @@ function todayInSendTimeZone() {
 }
 
 function runDailySend() {
-  runStartedAt = Date.now();
   const lastSuccess = PropertiesService.getScriptProperties().getProperty(LAST_PROCESSING_SUCCESS_KEY);
   const warning = lastSuccess === todayInSendTimeZone()
     ? null
     : `this morning's processing run did not complete (last successful run: ${lastSuccess || 'never'}).`;
-
-  // Finish descriptions before exporting: collect the Indeed results the 07:30
-  // run asked Apify for (waiting if it's somehow still going), and fetch any
-  // that are still blank. Never allowed to stop the email going out.
-  let descriptionNote = '';
-  try {
-    const sheet = getOrCreateSheet(SpreadsheetApp.getActiveSpreadsheet(), CONFIG.NEW_LEADS_SHEET_NAME);
-    ensureNewLeadsLayout(sheet);
-    fillJobDescriptions(sheet, false);
-    // Leaves ~90s of the time budget for the export and send.
-    collectApifyRuns(sheet, Math.min(DESCRIPTION_CONFIG.SEND_WAIT_SECONDS * 1000, timeLeftMs() - 90 * 1000));
-    descriptionNote = descriptionStatusLine(sheet);
-  } catch (err) {
-    Logger.log(`Job description step failed before the send: ${err}`);
-    descriptionNote = 'Job descriptions: the description step failed this morning (see the script log), so some may be missing.';
-  }
-  // Writes from this run must be saved before the export reads the sheet.
-  SpreadsheetApp.flush();
-  sendSheetCopy(warning, descriptionNote);
+  sendSheetCopy(warning);
 }
 
-function sendSheetCopy(warning, descriptionNote) {
+function sendSheetCopy(warning) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const dateStr = Utilities.formatDate(new Date(), DAILY_SEND_CONFIG.TIME_ZONE, 'dd/MM/yyyy');
   const recipients = DAILY_SEND_CONFIG.RECIPIENT_EMAILS.join(',');
@@ -1738,11 +1568,10 @@ function sendSheetCopy(warning, descriptionNote) {
   }
 
   const liveLink = `Live sheet (always up to date): ${ss.getUrl()}`;
-  const note = descriptionNote ? `\n\n${descriptionNote}` : '';
-  let body = `Attached is today's updated job alerts workbook.${note}\n\n${liveLink}\n\nThis is an automated daily send.`;
+  let body = `Attached is today's updated job alerts workbook.\n\n${liveLink}\n\nThis is an automated daily send.`;
   if (warning) {
     body = `WARNING: ${warning} This sheet may not include the latest listings.\n\n`
-      + `The workbook is attached as it currently stands.${note}\n\n${liveLink}`;
+      + `The workbook is attached as it currently stands.\n\n${liveLink}`;
   }
 
   try {
