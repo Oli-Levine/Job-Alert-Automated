@@ -16,7 +16,7 @@ This repo holds a single Google Apps Script file, **`Code.gs`**, that automates 
 - **Indeed, sponsored jobs** (ad links): not fetched. Apify's Indeed scraper won't take ad links. The cell says `No description (sponsored Indeed ad)`.
 - If a description can't be retrieved, the cell says `FETCH FAILED (reason)`. Nothing is ever made up.
 
-**Which leads get one:** the leads each morning's run adds to New Leads from the emails. Rows already in the sheet are left alone.
+**Which leads get one:** the leads each morning's run adds to New Leads from the emails, if found on or after **5 October 2026**. Rows already in the sheet, and anything found earlier, are left blank.
 
 **All in one run.** The ~7:30 run adds the new leads and fills their descriptions before it finishes; the ~8:30 email is unchanged. New leads are saved before descriptions are fetched, so a description problem can never lose a lead. If Apify is slow and the run nears Google's 6-minute limit, the Apify job is stopped (so it isn't charged further) and those cells say `FETCH FAILED`.
 

@@ -6,7 +6,8 @@
  *   - NEW "Job Description" column on New Leads, column H, after Staff ID.
  *     Columns A–G are unchanged, so the CRM import mapping still works.
  *   - Descriptions are downloaded, never written by the AI, for the rows
- *     each run adds to New Leads from the emails, all in the same run:
+ *     each run adds to New Leads from the emails (found on or after 5 Oct
+ *     2026, DESCRIPTION_CONFIG.START_DATE), all in the same run:
  *       - LinkedIn: LinkedIn's public job page (no API, no Apify, no AI).
  *       - Indeed (ordinary jobs, with a job ID in the link): Apify's Indeed
  *         scraper (misceres~indeed-scraper; Script Property APIFY_TOKEN).
@@ -154,6 +155,9 @@ const REASON_UNFILTER_NO_REGION = 'Unfilter Company, but AI gave no usable regio
 
 // ---- Job descriptions (New Leads column H) ------------------------------------
 const DESCRIPTION_CONFIG = {
+  // Leads found before this are never given a description (left blank), so
+  // the first run doesn't reach back into jobs from before descriptions began.
+  START_DATE: new Date('2026-10-05T00:00:00+01:00'),
   MAX_CHARS: 45000,          // a Sheets cell holds 50,000 characters at most
   LINKEDIN_BATCH_SIZE: 5,    // LinkedIn pages downloaded in parallel per batch
   APIFY_ACTOR: 'misceres~indeed-scraper',
@@ -324,7 +328,7 @@ function processJobAlerts() {
       // Start Apify for this email's new Indeed leads now, so it works while
       // the remaining emails go through the AI.
       if (source === 'Indeed') {
-        const newLinks = newRowsByTab[CONFIG.NEW_LEADS_SHEET_NAME].slice(newLeadsBefore).map(r => r[5]);
+        const newLinks = newRowsByTab[CONFIG.NEW_LEADS_SHEET_NAME].slice(newLeadsBefore).filter(wantsDescription).map(r => r[5]);
         runDescriptionStep('starting Indeed descriptions', () => startIndeedDescriptions(newLinks, indeedRuns));
       }
     });
@@ -355,7 +359,7 @@ function processJobAlerts() {
   // are caught and logged, never treated as a failed run.
   PropertiesService.getScriptProperties().setProperty(LAST_PROCESSING_SUCCESS_KEY, todayInSendTimeZone());
 
-  const newLeadLinks = newRowsByTab[CONFIG.NEW_LEADS_SHEET_NAME].map(r => r[5]);
+  const newLeadLinks = newRowsByTab[CONFIG.NEW_LEADS_SHEET_NAME].filter(wantsDescription).map(r => r[5]);
   runDescriptionStep('filling job descriptions', () => fillJobDescriptions(tabSheets[CONFIG.NEW_LEADS_SHEET_NAME], newLeadLinks, indeedRuns));
 
   Logger.log(`Done. ${addedCount} rows written (${companyRegionOverrideCount} redirected from Other via Company Regions, ${unfilteredCount} unfiltered via Unfilter Company). ${reviewCount} sent to Needs Review. ${filteredCount} filtered out (${blockedCount} due to Company Blocklist, ${blockedTitleCount} due to Job Title Blocklist). ${skippedEmails} email(s) skipped due to API/parse errors.`);
@@ -800,7 +804,14 @@ function safeCellText(value) {
 // - Indeed, sponsored jobs (pagead ad links, no job ID): not fetched — the
 //   scraper rejects ad links. The cell says DESCRIPTION_SPONSORED.
 // Anything that can't be retrieved says "FETCH FAILED (reason)", never a
-// guess. Rows moved into New Leads by applyListChanges() aren't fetched.
+// guess. Rows moved into New Leads by applyListChanges() aren't fetched, and
+// neither are leads found before DESCRIPTION_CONFIG.START_DATE (5 Oct 2026).
+
+// True for a New Leads row found on/after DESCRIPTION_CONFIG.START_DATE.
+// Earlier rows keep a blank description.
+function wantsDescription(row) {
+  return row[4] instanceof Date && row[4] >= DESCRIPTION_CONFIG.START_DATE;
+}
 
 // Runs a description step so that any failure is logged and can never stop
 // processJobAlerts() — the leads themselves are already saved.
