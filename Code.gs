@@ -27,6 +27,9 @@
  *     Leads rows are forced to one line high, so the tab stays neat however
  *     long a description is. The cell holds the full text (up to 45,000
  *     characters), which goes into the .xlsx / CRM import.
+ *   - LOOKBACK_DAYS 4 -> 2: the run is daily, so 2 days still covers every
+ *     email (with a day's slack if a run fails) while sending fewer emails
+ *     to the AI each run, which leaves more of the 6 minutes for descriptions.
  *
  * CHANGES FROM v20 (carried forward):
  *   - List changes now apply to rows ALREADY in the sheet, not just to new
@@ -61,7 +64,7 @@ const CONFIG = {
   UNFILTER_SHEET_NAME: 'Unfilter Company',
   COMPANY_REGIONS_SHEET_NAME: 'Company Regions',
   TORY_EMAIL: '', // TODO: add Tory's email address
-  LOOKBACK_DAYS: 4,
+  LOOKBACK_DAYS: 2, // runs daily, so 2 days covers each email with a day's slack (was 4 before v24)
   CLAUDE_API_URL: 'https://api.anthropic.com/v1/messages',
   CLAUDE_MODEL: 'claude-haiku-4-5-20251001' // cheap + plenty accurate at this volume; bump to 'claude-sonnet-4-6' if testing shows accuracy problems
 };

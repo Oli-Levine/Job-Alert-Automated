@@ -22,6 +22,8 @@ This repo holds a single Google Apps Script file, **`Code.gs`**, that automates 
 
 **Tidy tab.** The description column has a fixed width, text is cut off at the edge, and every row stays one line high. The cell still holds the full description, which goes into the `.xlsx` and the CRM.
 
+**Email lookback is now 2 days** (was 4). The run is daily, so 2 days still covers every alert, with a day's slack if a run fails, and each run sends fewer emails to the AI.
+
 **One-time setup:** in the Apps Script editor, **Project Settings → Script Properties**, add `APIFY_TOKEN` (your token from Apify → Settings → API & Integrations). Without it, LinkedIn descriptions still work and Indeed cells say why they failed.
 
 ## v22 / v23 — abandoned (`git show a22a280:Code.gs`)
