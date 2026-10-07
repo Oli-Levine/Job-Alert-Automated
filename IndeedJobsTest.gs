@@ -21,6 +21,9 @@
  * Use it in a test Google Sheet: Extensions > Apps Script, paste this in as
  * its own file, add Script Property APIFY_TOKEN (Project Settings), then:
  *   ijLoadJobs()          — adds up to 10 new jobs from the emails (free).
+ *   ijCountJobs()         — logs ordinary vs sponsored counts for every Indeed
+ *                           email in the window, no cap (free, writes nothing).
+ *                           ijCountJobs14Days() does the same for 14 days.
  *   ijFetchDescriptions() — fills descriptions for rows with none yet (or a
  *                           FETCH FAILED), waiting up to 4 minutes for Apify.
  *   ijCollect()           — picks up runs that hadn't finished in time.
@@ -98,6 +101,34 @@ function ijLoadJobs() {
   Logger.log(`${messages.length} email(s) from ${IJ_CONFIG.ALERT_SENDER} in the last ${IJ_CONFIG.EMAIL_DAYS} days, `
     + `${indeedEmails} of them Indeed, with ${found} job link(s) in all.`);
   Logger.log(`Added ${added.length} job(s) to "${IJ_CONFIG.TAB}" (${added.length - sponsored} ordinary, ${sponsored} sponsored; cap ${IJ_CONFIG.MAX_JOBS}).`);
+}
+
+// Counts ordinary vs sponsored jobs in every Indeed email of the last `days`
+// days (default EMAIL_DAYS), with no cap. Only logs; writes nothing, no Apify.
+function ijCountJobs(days) {
+  days = Number(days) || IJ_CONFIG.EMAIL_DAYS;
+  const messages = [];
+  GmailApp.search(`from:${IJ_CONFIG.ALERT_SENDER} newer_than:${days}d`)
+    .forEach(t => t.getMessages().forEach(m => messages.push(m)));
+  messages.sort((a, b) => b.getDate() - a.getDate());
+  const pct = (n, of) => (of ? Math.round(100 * n / of) : 0) + '%';
+  let emails = 0, total = 0, sponsored = 0;
+  messages.forEach(msg => {
+    const html = msg.getBody();
+    if (!ijIsIndeedEmail(html)) return;
+    const jobs = ijJobsInEmail(html);
+    const s = jobs.filter(j => !j.jobId).length;
+    emails++; total += jobs.length; sponsored += s;
+    Logger.log(`${msg.getDate().toLocaleString('en-GB')} "${msg.getSubject()}": ${jobs.length} job(s), `
+      + `${jobs.length - s} ordinary, ${s} sponsored (${pct(s, jobs.length)}).`);
+  });
+  Logger.log(`TOTAL over the last ${days} days: ${emails} Indeed email(s), ${total} job(s): `
+    + `${total - sponsored} ordinary, ${sponsored} sponsored (${pct(sponsored, total)} sponsored).`);
+}
+
+// The editor's Run button can't pass a number, so this gives a bigger sample.
+function ijCountJobs14Days() {
+  ijCountJobs(14);
 }
 
 function ijIsIndeedEmail(html) {
