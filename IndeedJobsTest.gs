@@ -6,14 +6,17 @@
  * so it costs nothing.
  * STEP 2: ijFetchDescriptions() sends the tab's jobs to Apify
  * (misceres~indeed-scraper) and fills Job Description / Description Status.
- * Ordinary and sponsored jobs go in two separate Apify runs, started
- * together: Apify has failed whole runs that contained sponsored ad links, and
- * this way that can't take the ordinary jobs down with it.
- *   - Ordinary jobs: the clean job link; results matched back by job ID.
- *   - Sponsored jobs: the ad link exactly as in the email; results matched
- *     back by job title (they have no job ID), and the status says so.
- * The execution log shows each run's outcome, the first result Apify sent,
- * and, for a failed run, the end of Apify's own log for it.
+ * Two Apify runs, started together:
+ *   - Jobs with a job ID (ordinary ones) go to misceres~indeed-scraper as the
+ *     clean job link, matched back by job ID. Confirmed working.
+ *   - Sponsored jobs (no job ID) go to a real browser (apify~web-scraper,
+ *     UK residential proxy) that opens the ad link as it is in the email,
+ *     follows it to the job page and reads the description there. The Indeed
+ *     scraper itself fails whole runs given ad links, so it's not used for them.
+ *     If the browser only gets the job ID, that's saved on the row and the next
+ *     ijFetchDescriptions() fetches it like an ordinary job.
+ * The execution log shows each run's outcome (for the browser: where each ad
+ * link landed), and, for a failed run, the end of Apify's own log for it.
  *
  * Use it in a test Google Sheet: Extensions > Apps Script, paste this in as
  * its own file, add Script Property APIFY_TOKEN (Project Settings), then:
@@ -31,6 +34,11 @@ const IJ_CONFIG = {
   TAB: 'Indeed Jobs',
   APIFY_API: 'https://api.apify.com/v2',
   APIFY_ACTOR: 'misceres~indeed-scraper',
+  BROWSER_ACTOR: 'apify~web-scraper',
+  BROWSER_MEMORY_MB: 2048,
+  // UK home-broadband IPs look like a normal visitor; Indeed blocks data-centre IPs.
+  // If Apify says the RESIDENTIAL group isn't available on the plan, use { useApifyProxy: true }.
+  BROWSER_PROXY: { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'], apifyProxyCountry: 'GB' },
   RUN_TIMEOUT_SECS: 600, // Apify stops (and stops charging for) a run after this
   WAIT_SECS: 240,        // how long ijFetchDescriptions() waits; Apps Script stops a run at 6 minutes
   MAX_CHARS: 45000       // a Sheets cell holds 50,000 characters
@@ -40,7 +48,6 @@ const IJ_PENDING = 'PENDING (waiting for Apify)';
 const IJ_FAILED = 'FETCH FAILED';
 // Apify's field names vary between scraper versions; the first one present wins.
 const IJ_DESCRIPTION_FIELDS = ['description', 'descriptionText', 'jobDescription', 'descriptionHTML', 'descriptionHtml'];
-const IJ_TITLE_FIELDS = ['positionName', 'title', 'jobTitle', 'displayTitle'];
 
 // Column layout. Step 2 fills DESCRIPTION and DESC_STATUS.
 const IJ_HEADERS = ['Email Date', 'Job Title', 'Details (from email)', 'Link Type', 'Job ID', 'Link', 'Job Description', 'Description Status'];
@@ -128,6 +135,9 @@ function ijJobsInEmail(html) {
 // STEP 2 — descriptions via Apify
 // ==========================================================================
 
+// Ordinary jobs, and sponsored ones whose job ID is already known, go to the
+// Indeed scraper by job ID. Sponsored jobs with no job ID yet go to a browser
+// run that follows the ad link. Both runs are started together.
 function ijFetchDescriptions() {
   const token = ijToken();
   if (!token) return;
@@ -138,26 +148,64 @@ function ijFetchDescriptions() {
     .slice(0, IJ_CONFIG.MAX_JOBS);
   if (!todo.length) { Logger.log('No rows need a description. (ijResetDescriptions() blanks them to test again.)'); return; }
 
-  ['Ordinary', 'Sponsored'].forEach(type => {
-    const group = todo.filter(x => x.r[IJ_COL.TYPE] === type);
-    if (!group.length) return;
-    const urls = [...new Set(group.map(x => String(x.r[IJ_COL.LINK])))];
-    const res = ijApify(token, 'post', `/acts/${IJ_CONFIG.APIFY_ACTOR}/runs?timeout=${IJ_CONFIG.RUN_TIMEOUT_SECS}`, {
+  const byId = todo.filter(x => x.r[IJ_COL.JOB_ID]);
+  const byBrowser = todo.filter(x => !x.r[IJ_COL.JOB_ID]);
+  if (byId.length) {
+    const urls = [...new Set(byId.map(x => ijViewUrl(x.r[IJ_COL.JOB_ID])))];
+    ijStartRun(token, sheet, byId, 'id', 'Indeed scraper (by job ID)', IJ_CONFIG.APIFY_ACTOR, '', {
       startUrls: urls.map(u => ({ url: u })),
       maxItems: urls.length
     });
-    if (res.error) {
-      Logger.log(`${type}: couldn't start Apify: ${res.error}`);
-      group.forEach(x => ijSet(sheet, x.i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (couldn't start Apify: ${res.error})`));
-      return;
-    }
-    group.forEach(x => ijSet(sheet, x.i, IJ_COL.DESC_STATUS, IJ_PENDING));
-    const runs = ijLoadRuns();
-    runs.push({ type: type, runId: res.data.id, datasetId: res.data.defaultDatasetId });
-    ijSaveRuns(runs);
-    Logger.log(`${type}: Apify run started for ${urls.length} job(s): ${ijRunLink(res.data.id)}`);
-  });
+  }
+  if (byBrowser.length) {
+    const links = [...new Set(byBrowser.map(x => String(x.r[IJ_COL.LINK])))];
+    ijStartRun(token, sheet, byBrowser, 'browser', 'Browser (sponsored ad links)', IJ_CONFIG.BROWSER_ACTOR, `&memory=${IJ_CONFIG.BROWSER_MEMORY_MB}`, {
+      startUrls: links.map(u => ({ url: u, userData: { link: u } })),
+      pageFunction: IJ_PAGE_FUNCTION,
+      proxyConfiguration: IJ_CONFIG.BROWSER_PROXY,
+      injectJQuery: false,
+      waitUntil: ['domcontentloaded'],
+      maxRequestRetries: 2,
+      maxPagesPerCrawl: links.length,
+      pageLoadTimeoutSecs: 60
+    });
+  }
   ijCollect(IJ_CONFIG.WAIT_SECS);
+}
+
+// Runs inside Apify's browser on the page the ad link ends up on: waits up to
+// 15s for Indeed's description box, then reports where it landed, the job ID
+// (from the address or the page's canonical link) and the description text.
+const IJ_PAGE_FUNCTION = `async function pageFunction(context) {
+  let description = null;
+  for (let i = 0; i < 30 && !description; i++) {
+    const el = document.querySelector('#jobDescriptionText');
+    if (el && el.innerText.trim()) description = el.innerText.trim();
+    else await new Promise(r => setTimeout(r, 500));
+  }
+  const canonical = document.querySelector('link[rel="canonical"]');
+  const jk = s => { const m = String(s || '').match(/[?&]v?jk=([0-9a-f]{16})/i); return m ? m[1] : null; };
+  return {
+    link: context.request.userData.link,
+    finalUrl: window.location.href,
+    jobId: jk(window.location.href) || jk(canonical && canonical.href),
+    pageTitle: document.title,
+    description: description
+  };
+}`;
+
+function ijStartRun(token, sheet, group, kind, label, actor, extraQuery, input) {
+  const res = ijApify(token, 'post', `/acts/${actor}/runs?timeout=${IJ_CONFIG.RUN_TIMEOUT_SECS}${extraQuery}`, input);
+  if (res.error) {
+    Logger.log(`${label}: couldn't start Apify: ${res.error}`);
+    group.forEach(x => ijSet(sheet, x.i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (couldn't start Apify: ${res.error})`));
+    return;
+  }
+  group.forEach(x => ijSet(sheet, x.i, IJ_COL.DESC_STATUS, IJ_PENDING));
+  const runs = ijLoadRuns();
+  runs.push({ kind: kind, label: label, runId: res.data.id, datasetId: res.data.defaultDatasetId, links: group.map(x => String(x.r[IJ_COL.LINK])) });
+  ijSaveRuns(runs);
+  Logger.log(`${label}: Apify run started for ${group.length} job(s): ${ijRunLink(res.data.id)}`);
 }
 
 // Writes the results of every finished run into its PENDING rows. Runs still
@@ -170,41 +218,59 @@ function ijCollect(waitSecs) {
   const stillGoing = [];
 
   ijLoadRuns().forEach(run => {
+    const label = run.label || run.type;
     const info = ijWaitForRun(token, run.runId, deadline);
-    if (!info) { stillGoing.push(run); Logger.log(`${run.type}: run still going; run ijCollect() in a few minutes. ${ijRunLink(run.runId)}`); return; }
-    if (info.error) { stillGoing.push(run); Logger.log(`${run.type}: couldn't check the run: ${info.error}`); return; }
+    if (!info) { stillGoing.push(run); Logger.log(`${label}: run still going; run ijCollect() in a few minutes. ${ijRunLink(run.runId)}`); return; }
+    if (info.error) { stillGoing.push(run); Logger.log(`${label}: couldn't check the run: ${info.error}`); return; }
 
     const res = ijApify(token, 'get', `/datasets/${run.datasetId}/items?clean=true&format=json`);
     const items = Array.isArray(res.data) ? res.data : [];
-    Logger.log(`${run.type}: run ${info.status}${info.statusMessage ? ` (${info.statusMessage})` : ''}, ${items.length} result(s). ${ijRunLink(run.runId)}`);
-    if (items.length) Logger.log(`${run.type}: first result: ${JSON.stringify(items[0]).substring(0, 1500)}`);
-    if (info.status !== 'SUCCEEDED') Logger.log(`${run.type}: end of Apify's own log for this run:\n${ijRunLog(token, run.runId)}`);
+    Logger.log(`${label}: run ${info.status}${info.statusMessage ? ` (${info.statusMessage})` : ''}, ${items.length} result(s). ${ijRunLink(run.runId)}`);
+    if (run.kind === 'browser') items.forEach(it => Logger.log(`${label}: ${it.link}\n  landed on: ${it.finalUrl}\n  page title: "${it.pageTitle}", job ID: ${it.jobId || 'none'}, description: ${it.description ? it.description.length + ' chars' : 'none'}`));
+    else if (items.length) Logger.log(`${label}: first result: ${JSON.stringify(items[0]).substring(0, 1500)}`);
+    if (info.status !== 'SUCCEEDED') Logger.log(`${label}: end of Apify's own log for this run:\n${ijRunLog(token, run.runId)}`);
     const runNote = info.status === 'SUCCEEDED' ? '' : `; Apify run ${info.status}${info.statusMessage ? `: ${info.statusMessage}` : ''}`;
+    const links = new Set(run.links || []);
 
     ijRows(sheet).forEach((r, i) => {
-      if (r[IJ_COL.TYPE] !== run.type || r[IJ_COL.DESC_STATUS] !== IJ_PENDING) return;
+      if (r[IJ_COL.DESC_STATUS] !== IJ_PENDING || (run.links && !links.has(String(r[IJ_COL.LINK])))) return;
       if (res.error) { ijSet(sheet, i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (couldn't read Apify's results: ${res.error})`); return; }
-      const byId = run.type === 'Ordinary';
-      const item = byId
-        ? items.find(it => JSON.stringify(it).indexOf(r[IJ_COL.JOB_ID]) !== -1)
-        : items.find(it => ijNorm(ijPick(it, IJ_TITLE_FIELDS)) === ijNorm(r[IJ_COL.TITLE]));
-      if (!item) {
-        ijSet(sheet, i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (no result for this job; ${items.length} result(s) in the run${runNote})`);
-        return;
-      }
-      const field = IJ_DESCRIPTION_FIELDS.find(f => item[f]);
-      const value = field ? item[field] : '';
-      let text = ijDescriptionText(typeof value === 'object' ? (value.html || value.text || JSON.stringify(value)) : value);
-      if (!r[IJ_COL.JOB_ID]) { const jk = ijJobId(JSON.stringify(item)); if (jk) ijSet(sheet, i, IJ_COL.JOB_ID, jk); }
-      if (text.length < 50) { ijSet(sheet, i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (Apify's result had no description)`); return; }
-      if (text.length > IJ_CONFIG.MAX_CHARS) text = text.substring(0, IJ_CONFIG.MAX_CHARS) + ' …(truncated)';
-      ijSet(sheet, i, IJ_COL.DESCRIPTION, /^[=+\-@]/.test(text) ? `'${text}` : text); // stop Sheets reading it as a formula
-      ijSet(sheet, i, IJ_COL.DESC_STATUS, `OK (matched by ${byId ? 'job ID' : 'title'})`);
+      if (run.kind === 'browser') ijWriteBrowserResult(sheet, i, items.find(it => it.link === String(r[IJ_COL.LINK])), items.length, runNote);
+      else ijWriteScraperResult(sheet, i, items.find(it => JSON.stringify(it).indexOf(r[IJ_COL.JOB_ID]) !== -1), items.length, runNote);
     });
   });
 
   ijSaveRuns(stillGoing);
   Logger.log(`Done${stillGoing.length ? `; ${stillGoing.length} run(s) still going` : ''}. See the "${IJ_CONFIG.TAB}" tab.`);
+}
+
+function ijWriteScraperResult(sheet, i, item, count, runNote) {
+  if (!item) { ijSet(sheet, i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (no result for this job; ${count} result(s) in the run${runNote})`); return; }
+  const field = IJ_DESCRIPTION_FIELDS.find(f => item[f]);
+  const value = field ? item[field] : '';
+  ijWriteDescription(sheet, i, ijDescriptionText(typeof value === 'object' ? (value.html || value.text || JSON.stringify(value)) : value), 'Indeed scraper, matched by job ID');
+}
+
+// A browser result can give the description, or just the job ID — which is
+// then saved on the row, so the next ijFetchDescriptions() sends it to the
+// Indeed scraper by job ID like an ordinary job.
+function ijWriteBrowserResult(sheet, i, item, count, runNote) {
+  if (!item) { ijSet(sheet, i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (browser couldn't open the ad link; ${count} result(s) in the run${runNote})`); return; }
+  if (item.jobId) ijSet(sheet, i, IJ_COL.JOB_ID, item.jobId);
+  const text = item.description ? ijDescriptionText(item.description) : '';
+  if (text.length >= 50) { ijWriteDescription(sheet, i, text, 'browser followed the ad link'); return; }
+  const host = (String(item.finalUrl).match(/^https?:\/\/([^/]+)/) || [])[1] || '?';
+  const reason = item.jobId ? `browser found job ID ${item.jobId} but no description; run ijFetchDescriptions() again to fetch it by job ID`
+    : !/indeed\./i.test(host) ? `ad goes to the employer's own site (${host}), not an Indeed job page`
+    : `browser landed on "${item.pageTitle}" with no job ID; probably blocked`;
+  ijSet(sheet, i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (${reason})`);
+}
+
+function ijWriteDescription(sheet, i, text, how) {
+  if (text.length < 50) { ijSet(sheet, i, IJ_COL.DESC_STATUS, `${IJ_FAILED} (${how}: result had no description)`); return; }
+  if (text.length > IJ_CONFIG.MAX_CHARS) text = text.substring(0, IJ_CONFIG.MAX_CHARS) + ' …(truncated)';
+  ijSet(sheet, i, IJ_COL.DESCRIPTION, /^[=+\-@]/.test(text) ? `'${text}` : text); // stop Sheets reading it as a formula
+  ijSet(sheet, i, IJ_COL.DESC_STATUS, `OK (${how})`);
 }
 
 // Blanks Job Description and Description Status on every row, and forgets
@@ -310,15 +376,6 @@ function ijSet(sheet, rowIndex, col, value) {
   sheet.getRange(rowIndex + 2, col + 1).setValue(value);
 }
 
-function ijPick(item, names) {
-  const k = names.find(n => item[n]);
-  return k ? String(item[k]) : '';
-}
-
-function ijNorm(s) {
-  return String(s || '').toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
-}
-
 // Description HTML (or plain text) to readable text, keeping bullets and line breaks.
 function ijDescriptionText(html) {
   return ijDecode(String(html || '')
@@ -328,6 +385,10 @@ function ijDescriptionText(html) {
     .replace(/<[^>]+>/g, ''))
     .replace(/[ \t]+\n/g, '\n').replace(/\n{2,}/g, '\n')
     .trim();
+}
+
+function ijViewUrl(jobId) {
+  return `https://uk.indeed.com/viewjob?jk=${jobId}`;
 }
 
 // Indeed's job ID (jk): 16 hex characters in the link's jk= / vjk= parameter.
